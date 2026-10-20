@@ -1,0 +1,32 @@
+[package]
+name = "automantle-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libc = "0.2"
+signal-hook = "0.3"
+serde = { version = "1", features = ["derive"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+rcgen = { version = "0.13.2", features = ["x509-parser"] }
+x509-parser = { version = "0.17", features = ["verify"] }
+time = "=0.3.47"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
+
+[[bin]]
+name = "automantle-gateway"
+path = "src/main.rs"
