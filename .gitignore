@@ -84,7 +84,6 @@ gateway.json
 .aws/
 .ssh/
 .kube/
-.docker/config.json
 /secrets/
 /.secrets/
 
