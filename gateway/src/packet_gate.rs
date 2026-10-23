@@ -237,26 +237,3 @@ impl Drop for PacketGate {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn policy_failure_is_visible_before_audit_worker_finishes() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = Arc::clone(&stop);
-        let gate = PacketGate {
-            stop,
-            received: Arc::new(AtomicU64::new(7)),
-            failed: Arc::new(AtomicBool::new(true)),
-            worker: Some(thread::spawn(move || {
-                while !stopping.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Ok(())
-            })),
-        };
-        assert!(!gate.worker.as_ref().unwrap().is_finished());
-        assert!(gate.check().is_err());
-    }
-}

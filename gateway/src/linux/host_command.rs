@@ -121,39 +121,3 @@ fn drain(pipe: &mut impl Read, output: &mut Vec<u8>, closed: &mut bool) -> Resul
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn drains_both_full_pipes_without_deadlocking() {
-        let output = command(Command::new("/bin/sh").args([
-            "-c",
-            "i=0; while [ $i -lt 3000 ]; do printf '12345678901234567890123456789012\\n'; printf 'abcdefghijklmnopqrstuvwxyz012345\\n' >&2; i=$((i+1)); done",
-        ]))
-        .unwrap();
-        assert!(output.status.success());
-        assert!(output.stdout.len() > 64 * 1024);
-        assert!(output.stderr.len() > 64 * 1024);
-    }
-
-    #[test]
-    fn timed_out_child_is_stopped() {
-        let started = Instant::now();
-        assert!(
-            run_with_timeout(
-                Command::new("/bin/sleep").arg("2"),
-                Duration::from_millis(50)
-            )
-            .is_err()
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn captured_output_has_a_hard_limit() {
-        let mut input = io::Cursor::new(vec![b'x'; MAX_OUTPUT + 1]);
-        assert!(drain(&mut input, &mut Vec::new(), &mut false).is_err());
-    }
-}

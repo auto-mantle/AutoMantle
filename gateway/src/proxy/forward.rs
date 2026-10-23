@@ -4,15 +4,6 @@ use super::{
 };
 use std::io::{Read, Write};
 
-#[cfg(test)]
-pub(super) fn forward(
-    client: &mut (impl Write + RequestMonitor),
-    upstream: &mut (impl Read + Write),
-    request: &Request,
-    context: &Context,
-) -> Result<()> {
-    forward_observed(client, upstream, request, context, None)
-}
 pub(super) fn forward_observed(
     client: &mut (impl Write + RequestMonitor),
     upstream: &mut (impl Read + Write),

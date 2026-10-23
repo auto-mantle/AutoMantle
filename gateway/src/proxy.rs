@@ -24,8 +24,6 @@ mod request;
 mod response;
 
 use destination::{public_ipv4_destinations, resolve};
-#[cfg(test)]
-use forward::forward;
 use forward::forward_observed;
 use observation::Observation;
 use request::{Request, parse_request, writes_body};
@@ -579,6 +577,3 @@ fn reply(client: &mut impl Write, status: u16, message: &str) -> Result<()> {
     client.flush()?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

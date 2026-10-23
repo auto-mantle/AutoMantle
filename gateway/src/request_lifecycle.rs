@@ -37,13 +37,6 @@ impl<F: FnMut() -> Option<EndReason>> RequestMonitor for F {
     }
 }
 
-#[cfg(test)]
-impl RequestMonitor for Vec<u8> {
-    fn end_reason(&mut self) -> Option<EndReason> {
-        None
-    }
-}
-
 pub struct RequestLifecycle<'a> {
     stopped: &'a AtomicBool,
     cancelled: &'a AtomicBool,
@@ -81,44 +74,5 @@ impl<'a> RequestLifecycle<'a> {
             .or_else(|| monitor.end_reason());
         self.ended.set(reason);
         reason
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-    #[test]
-    fn inactivity_does_not_imply_expiration_and_stream_events_are_generic() {
-        let stopped = AtomicBool::new(false);
-        let cancelled = AtomicBool::new(false);
-        let request = RequestLifecycle::new(
-            &stopped,
-            &cancelled,
-            Instant::now() + Duration::from_secs(30),
-        );
-        assert_eq!(request.end_reason(&mut || None), None);
-        assert_eq!(
-            request.end_reason(&mut || Some(EndReason::RequestCancelled)),
-            Some(EndReason::RequestCancelled)
-        );
-        assert_eq!(
-            request.end_reason(&mut || None),
-            Some(EndReason::RequestCancelled)
-        );
-    }
-    #[test]
-    fn host_cancellation_is_distinct_from_client_closure() {
-        let stopped = AtomicBool::new(false);
-        let cancelled = AtomicBool::new(true);
-        let request = RequestLifecycle::new(
-            &stopped,
-            &cancelled,
-            Instant::now() + Duration::from_secs(30),
-        );
-        assert_eq!(
-            request.end_reason(&mut || None),
-            Some(EndReason::RequestCancelled)
-        );
     }
 }

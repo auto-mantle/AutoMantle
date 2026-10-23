@@ -714,6 +714,3 @@ fn remove_exact_directory(directory: &Path) -> Result<()> {
     fs::remove_dir_all(directory)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

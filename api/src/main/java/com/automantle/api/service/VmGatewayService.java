@@ -103,7 +103,7 @@ public class VmGatewayService {
             }
         } catch (UnsupportedOperationException exception) {
             throw new IOException(
-                    "VM controls require the app and gateway on the same Linux/WSL host",
+                    "VM controls require the app and gateway on the same Linux host",
                     exception);
         }
     }

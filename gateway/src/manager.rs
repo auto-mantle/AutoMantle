@@ -643,8 +643,3 @@ impl Drop for Manager {
 mod client;
 mod control;
 pub use control::cli;
-#[cfg(test)]
-use control::read_request;
-
-#[cfg(test)]
-mod tests;

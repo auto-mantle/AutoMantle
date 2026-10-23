@@ -139,7 +139,7 @@ pub fn cli(args: &[String]) -> Result<()> {
         .map(String::as_str)
         .ok_or("command is required")?;
     if command == "start" && unsafe { libc::geteuid() } != 0 {
-        return Err("gateway management requires sudo on Linux/WSL".into());
+        return Err("gateway management requires root on Linux".into());
     }
     let mut values = args[1..].to_vec();
     let mut socket = PathBuf::from(SOCKET);

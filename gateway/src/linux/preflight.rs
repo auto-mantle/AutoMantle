@@ -59,7 +59,7 @@ pub(super) fn check(binary: &Path) -> Result<()> {
         return Err("Landlock is required by this sandbox profile but is unavailable".into());
     }
     if !Path::new("/run/systemd/system").is_dir() {
-        return Err("systemd must be running; enable systemd in WSL".into());
+        return Err("systemd must be running on Linux".into());
     }
     let controllers = fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")?;
     for required in ["cpu", "memory", "pids"] {

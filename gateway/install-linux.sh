@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $EUID != 0 || $# != 1 ]]; then
-    echo 'Usage: sudo bash install-wsl.sh /absolute/path/to/automantle-gateway' >&2
+    echo 'Usage: sudo bash install-linux.sh /absolute/path/to/automantle-gateway' >&2
     exit 2
 fi
 if [[ $(uname -m) != x86_64 ]]; then
@@ -10,11 +10,11 @@ if [[ $(uname -m) != x86_64 ]]; then
     exit 1
 fi
 if [[ ! -c /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-    echo 'KVM is unavailable at /dev/kvm. Enable nested virtualization and KVM in the WSL host first.' >&2
+    echo 'KVM is unavailable at /dev/kvm. Enable KVM on the Linux host first.' >&2
     exit 1
 fi
 if [[ ! -d /run/systemd/system ]]; then
-    echo 'systemd must be enabled and running in WSL.' >&2
+    echo 'systemd must be running on the Linux host.' >&2
     exit 1
 fi
 
@@ -34,7 +34,7 @@ if ! command -v ip >/dev/null || ! command -v nft >/dev/null; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 nftables
 fi
-getent group kvm >/dev/null || { echo 'The WSL host must provide a kvm group for /dev/kvm access.' >&2; exit 1; }
+getent group kvm >/dev/null || { echo 'The Linux host must provide a kvm group for /dev/kvm access.' >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 url='https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/cloud-hypervisor-static'
