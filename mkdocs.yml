@@ -1,0 +1,17 @@
+site_name: AutoMantle Documentation
+site_url: https://docs.automantle.com/
+site_description: Install, configure, and operate AutoMantle.
+docs_dir: docs
+site_dir: site
+theme:
+  name: mkdocs
+nav:
+  - Overview: index.md
+  - Getting started: getting-started.md
+  - How it works: concepts.md
+  - Agent profiles and policies: policies.md
+  - Virtual machines: virtual-machines.md
+  - Approvals and request history: approvals.md
+  - Credentials: credentials.md
+  - Operations and troubleshooting: operations.md
+  - CLI and configuration: reference.md

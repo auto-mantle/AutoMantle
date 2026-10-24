@@ -33,6 +33,7 @@ release.properties
 
 node_modules/
 dist/
+site/
 coverage/
 .nyc_output/
 
