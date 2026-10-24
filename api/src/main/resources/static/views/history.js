@@ -57,7 +57,7 @@ export async function historyView(container, context) {
     finally { clearing = false; clear.disabled = false; }
     if (!loading && context.isCurrent()) await refresh();
   }, "button danger");
-  container.replaceChildren(node("div", { className: "actions page-actions" }, button("Refresh newest", () => refresh()), clear),
+  container.replaceChildren(node("div", { className: "actions page-actions" }, clear),
     help, node("label", { className: "field" }, "Agent profile", profile), errors, list, more);
   try {
     const profiles = await apiRequest("/agents/profiles");

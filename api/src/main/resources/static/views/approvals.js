@@ -72,8 +72,8 @@ export async function approvalsView(container, context) {
     } catch (error) { if (context.isCurrent()) notice(errors, error, refresh); }
     finally { loading = false; }
   };
-  container.replaceChildren(node("div", { className: "actions page-actions" }, button("Refresh", refresh)),
-    node("div", { className: "actions" }, node("label", {}, pendingOnly, " Pending only"), previous, pageLabel, next), errors, list);
+  container.replaceChildren(node("div", { className: "actions page-actions" },
+    node("label", {}, pendingOnly, " Pending only"), previous, pageLabel, next), errors, list);
   await refresh();
   if (context.isCurrent()) context.setPoll(setInterval(() => { if (!document.hidden) void refresh(); }, 2000));
 }

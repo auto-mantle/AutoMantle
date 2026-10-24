@@ -153,8 +153,7 @@ export async function vmsView(container, context) {
     }) : [empty("No VMs yet. Create one with Linux included.")]));
   }
   container.replaceChildren(node("div", { className: "actions page-actions" },
-    button("Create VM", () => editor.replaceChildren(settingsForm()), "button primary"),
-    button("Refresh", () => { void refresh().catch(error => notice(errors, error)); })),
+    button("Create VM", () => editor.replaceChildren(settingsForm()), "button primary")),
     errors, editor, terminalPanel, runs);
   let refreshing = false;
   const reload = async () => { if (refreshing || disposed) return; refreshing = true; try { await refresh(); } catch (error) { notice(errors, error); } finally { refreshing = false; } };

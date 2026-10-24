@@ -78,5 +78,8 @@ test("every dashboard view renders with the shared UI helpers", async t => {
   globalThis.setInterval = () => 0;
   await import("../../main/resources/static/app.js");
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(visibleText(main), /Dashboard.*Example agent/);
+  assert.equal(main.children[0].className, "dashboard-layout");
+  assert.equal(main.children[0].children[0].tag, "nav");
+  assert.match(visibleText(main), /Agent Profiles.*Example agent/);
+  assert.doesNotMatch(visibleText(main), /CONTROL PLANE|Manage agent access/);
 });

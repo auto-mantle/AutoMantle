@@ -50,10 +50,8 @@ async function loadView() {
         if (selected) tabButton.setAttribute("aria-current", "page");
         tabs.append(tabButton);
       }
-      main.replaceChildren(node("div", { className: "dashboard-intro" },
-        node("div", {}, node("p", { className: "eyebrow" }, "CONTROL CENTER"), node("h1", {}, "Dashboard")),
-        node("p", { className: "muted" }, "Manage agent access, virtual machines, and requests.")),
-      tabs, errors, content);
+      main.replaceChildren(node("div", { className: "dashboard-layout" },
+        tabs, node("div", { className: "dashboard-panel" }, errors, content)));
       if (selectedTab === "vms") await vmsView(content, context);
       else if (selectedTab === "credentials") await credentialsView(content, context);
       else if (selectedTab === "approvals") await approvalsView(content, context);

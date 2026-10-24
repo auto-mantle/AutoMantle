@@ -22,11 +22,13 @@ export async function profilesView(container, context) {
         node("thead", {}, node("tr", {}, ["Name", "Actions"].map(label => node("th", { scope: "col" }, label)))), body)));
     } catch (error) { if (context.isCurrent()) { list.replaceChildren(); notice(errors, error, refresh); } }
   };
+  const closeEditor = () => { editor.replaceChildren(); create.hidden = false; };
   const create = button("Create Profile", () => {
     editor.replaceChildren(makeForm("Create Agent Profile", [field("Name", "name", "", { required: true, maxlength: 255, placeholder: "code-reviewer-bot" })], async data => {
       await apiRequest("/agents/profiles", jsonRequest("POST", { name: data.get("name") }));
-      editor.replaceChildren(); await refresh();
-    }, "Create Profile", () => editor.replaceChildren()));
+      closeEditor(); await refresh();
+    }, "Create Profile", closeEditor));
+    create.hidden = true;
     editor.querySelector("input").focus();
   }, "button primary");
   container.replaceChildren(node("div", { className: "actions page-actions" }, create), errors, editor, list);

@@ -101,8 +101,7 @@ export async function credentialsView(container, context) {
     } catch (error) { if (context.isCurrent()) notice(errors, error); }
   }
   container.replaceChildren(node("div", { className: "actions page-actions" },
-    button("Add credential", () => editCredential(), "button primary"),
-    button("Refresh", () => refresh())),
+    button("Add credential", () => editCredential(), "button primary")),
     node("p", { className: "muted small" }, "Configure secrets and their scope here. Profile rules control requests. Both checks must allow credential use. Only the credential name is replaced; surrounding text stays as sent. Saved secrets stay outside the VM and are never shown again."),
     errors, editor, list);
   await refresh();
