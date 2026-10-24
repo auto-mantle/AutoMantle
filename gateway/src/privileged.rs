@@ -27,6 +27,17 @@ mod host;
 struct Reply {
     value: Value,
     file: Option<File>,
+    network: Option<crate::linux::network::HostNetwork>,
+}
+
+impl Reply {
+    fn new(value: Value, file: Option<File>) -> Self {
+        Self {
+            value,
+            file,
+            network: None,
+        }
+    }
 }
 
 fn send_header(stream: &UnixStream, file: Option<&File>) -> Result<()> {
@@ -135,10 +146,10 @@ fn listener_from_systemd() -> Result<UnixListener> {
         return Err("helper requires one systemd socket".into());
     }
     let listener = unsafe { UnixListener::from_raw_fd(3) };
-    if !listener
+    if listener
         .local_addr()?
         .as_pathname()
-        .is_some_and(|p| p == Path::new(SOCKET))
+        .is_none_or(|p| p != Path::new(SOCKET))
     {
         return Err("unexpected helper socket".into());
     }
@@ -155,10 +166,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
                 return Err("unexpected helper descriptor".into());
             }
             exact_fields(fields, &["command"])?;
-            Ok(Reply {
-                value: json!({"status":"ready"}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"status":"ready"}), None))
         }
         Some("create-network") => {
             if file.is_some() {
@@ -170,10 +178,11 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
             let user = service_user(id)?;
             let network = crate::linux::network::HostNetwork::create(id, &user, "automantle")?;
             let socket = crate::packet_gate::guest_sender(&network.config().tap)?;
-            let config = network.detach();
+            let config = network.config().clone();
             Ok(Reply {
                 value: serde_json::to_value(config)?,
                 file: Some(socket),
+                network: Some(network),
             })
         }
         Some("remove-network") => {
@@ -183,10 +192,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
             exact_fields(fields, &["command", "id"])?;
             host::ensure_vmm_stopped(run_id(request)?)?;
             crate::linux::network::HostNetwork::remove_by_id(run_id(request)?)?;
-            Ok(Reply {
-                value: json!({"removed":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"removed":true}), None))
         }
         Some("create-run") => {
             if file.is_some() {
@@ -194,10 +200,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
             }
             exact_fields(fields, &["command", "id"])?;
             host::create_run(run_id(request)?)?;
-            Ok(Reply {
-                value: json!({"created":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"created":true}), None))
         }
         Some("prepare-run") => {
             exact_fields(fields, &["command", "id", "saved", "initramfs"])?;
@@ -211,10 +214,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
                 return Err("saved root descriptor mismatch".into());
             }
             host::prepare_run(run_id(request)?, file, initramfs)?;
-            Ok(Reply {
-                value: json!({"prepared":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"prepared":true}), None))
         }
         Some("release-saved") => {
             exact_fields(fields, &["command", "id"])?;
@@ -222,10 +222,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
                 run_id(request)?,
                 file.ok_or("saved root descriptor required")?,
             )?;
-            Ok(Reply {
-                value: json!({"released":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"released":true}), None))
         }
         Some("start-vmm") => {
             if file.is_some() {
@@ -233,10 +230,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
             }
             exact_fields(fields, &["command", "id", "settings"])?;
             host::start_vmm(run_id(request)?, &request["settings"])?;
-            Ok(Reply {
-                value: json!({"started":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"started":true}), None))
         }
         Some("stop-vmm") => {
             if file.is_some() {
@@ -244,10 +238,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
             }
             exact_fields(fields, &["command", "id"])?;
             host::stop_vmm(run_id(request)?)?;
-            Ok(Reply {
-                value: json!({"stopped":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"stopped":true}), None))
         }
         Some("connect-vmm") => {
             if file.is_some() {
@@ -258,10 +249,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
                 .as_str()
                 .ok_or("VM socket kind is required")?;
             let socket = host::connect_socket(run_id(request)?, kind)?;
-            Ok(Reply {
-                value: json!({"connected":true}),
-                file: Some(socket),
-            })
+            Ok(Reply::new(json!({"connected":true}), Some(socket)))
         }
         Some("destroy-run") => {
             if file.is_some() {
@@ -269,10 +257,7 @@ fn dispatch(request: &Value, file: Option<File>) -> Result<Reply> {
             }
             exact_fields(fields, &["command", "id"])?;
             host::destroy_run(run_id(request)?)?;
-            Ok(Reply {
-                value: json!({"destroyed":true}),
-                file: None,
-            })
+            Ok(Reply::new(json!({"destroyed":true}), None))
         }
         _ => Err("unknown helper operation".into()),
     }
@@ -295,7 +280,7 @@ fn run_id(request: &Value) -> Result<&str> {
 }
 
 fn service_user(id: &str) -> Result<String> {
-    let suffix = id.strip_prefix("automantle-vm-").ok_or("invalid run ID")?;
+    let suffix = crate::linux::run_suffix(id)?;
     Ok(format!("amv{}", &suffix[..10]))
 }
 
@@ -315,12 +300,15 @@ fn handle(mut stream: UnixStream, uid: u32) -> Result<()> {
             .map_err(Into::into)
             .and_then(|v| dispatch(&v, file))
     };
-    let (response, file) = match response {
-        Ok(reply) => (json!({"result":reply.value}), reply.file),
-        Err(error) => (json!({"error":error.to_string()}), None),
+    let (response, file, network) = match response {
+        Ok(reply) => (json!({"result":reply.value}), reply.file, reply.network),
+        Err(error) => (json!({"error":error.to_string()}), None, None),
     };
     send_header(&stream, file.as_ref())?;
     writeln!(stream, "{response}")?;
+    if let Some(network) = network {
+        let _ = network.detach();
+    }
     Ok(())
 }
 

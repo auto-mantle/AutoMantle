@@ -83,6 +83,7 @@ impl Store {
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
+            let _ = fs::remove_file(directory.join("rootfs"));
             let _ = fs::remove_dir(&directory);
         }
         result

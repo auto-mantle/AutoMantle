@@ -54,14 +54,15 @@ fn collect_output(child: &mut Child, deadline: Instant) -> Result<Output> {
     loop {
         drain(&mut stdout, &mut out, &mut out_closed)?;
         drain(&mut stderr, &mut err, &mut err_closed)?;
-        if let Some(status) = child.try_wait()? {
-            if out_closed && err_closed {
-                return Ok(Output {
-                    status,
-                    stdout: out,
-                    stderr: err,
-                });
-            }
+        if let Some(status) = child.try_wait()?
+            && out_closed
+            && err_closed
+        {
+            return Ok(Output {
+                status,
+                stdout: out,
+                stderr: err,
+            });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

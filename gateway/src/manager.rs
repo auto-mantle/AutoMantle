@@ -10,7 +10,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -19,6 +19,9 @@ use std::{
 const SOCKET: &str = "/run/automantle-gateway/control.sock";
 const CONSOLE_LIMIT: usize = 256 * 1024;
 const REQUEST_LIMIT: usize = 64 * 1024;
+const MAX_ACTIVE_RUNS: usize = 4;
+const MAX_RUN_HISTORY: usize = 128;
+const MAX_IMPORTS: usize = 4;
 
 fn string_args(
     request: &Value,
@@ -55,6 +58,61 @@ struct Record {
     console: VecDeque<u8>,
     console_total: u64,
     terminal: Option<UnixStream>,
+}
+impl Record {
+    fn new(request: &RunRequest) -> Self {
+        Self {
+            profile: request.agent_profile_id.clone(),
+            saved_disk: request.saved_disk.clone(),
+            storage_mode: if request.preparation {
+                "prepare"
+            } else {
+                "runtime"
+            },
+            setup_mode: request.setup_mode,
+            state: "queued".into(),
+            error: None,
+            console: VecDeque::new(),
+            console_total: 0,
+            terminal: None,
+        }
+    }
+
+    fn apply(&mut self, event: RunEvent) {
+        match event {
+            RunEvent::State(state) => {
+                if self.state != "stopping" {
+                    self.state = state.into();
+                }
+            }
+            RunEvent::Console(bytes) => {
+                self.console_total += bytes.len() as u64;
+                self.console.extend(bytes);
+                while self.console.len() > CONSOLE_LIMIT {
+                    self.console.pop_front();
+                }
+            }
+            RunEvent::Terminal(stream) => self.terminal = Some(stream),
+        }
+    }
+
+    fn finish(&mut self, result: std::result::Result<(), String>) {
+        self.terminal = None;
+        match result {
+            Ok(()) => self.state = "stopped".into(),
+            Err(error) if error == "run interrupted" => self.state = "stopped".into(),
+            Err(error) => {
+                self.state = "failed".into();
+                self.error = Some(error);
+            }
+        }
+    }
+}
+fn record_guard(record: &Mutex<Record>) -> MutexGuard<'_, Record> {
+    record.lock().unwrap_or_else(|poisoned| {
+        eprintln!("VM record lock poisoned; recovering state");
+        poisoned.into_inner()
+    })
 }
 struct Task {
     record: Arc<Mutex<Record>>,
@@ -95,17 +153,47 @@ struct Manager {
 }
 
 impl Manager {
+    fn spawn_import(
+        &mut self,
+        mut stream: UnixStream,
+        operation: impl FnOnce(&AtomicBool) -> Result<Value> + Send + 'static,
+    ) {
+        let mut worker_stream = match stream.try_clone() {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = writeln!(stream, "{}", json!({"error":error.to_string()}));
+                return;
+            }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        match thread::Builder::new()
+            .name("vm-import".into())
+            .spawn(move || {
+                let reply = match operation(&worker_cancel) {
+                    Ok(result) => json!({"result":result}),
+                    Err(error) => json!({"error":error.to_string()}),
+                };
+                let _ = writeln!(worker_stream, "{reply}");
+            }) {
+            Ok(worker) => self.imports.push(Import { cancel, worker }),
+            Err(error) => {
+                let _ = writeln!(stream, "{}", json!({"error":error.to_string()}));
+            }
+        }
+    }
+
     fn busy_machine(&self, id: &str) -> bool {
         self.tasks.values().any(|task| {
             !task.worker.is_finished()
-                && task.record.lock().unwrap().saved_disk.as_deref() == Some(id)
+                && record_guard(&task.record).saved_disk.as_deref() == Some(id)
         })
     }
     fn import_machine(&mut self, request: Value, mut stream: UnixStream) {
         self.imports
             .retain_mut(|import| !import.worker.is_finished());
         let response = (|| -> Result<(Option<String>, crate::machines::Settings)> {
-            if self.imports.len() >= 4 {
+            if self.imports.len() >= MAX_IMPORTS {
                 return Err("Four VM copies are already in progress".into());
             }
             let command = request["command"].as_str().ok_or("command is required")?;
@@ -155,20 +243,13 @@ impl Manager {
         };
         let store = self.storage.clone();
         let base = self.defaults.rootfs.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let worker = thread::spawn(move || {
-            let result = match source {
-                Some(id) => store.copy_machine(&id, settings.name, &worker_cancel),
-                None => store.create_machine(settings, &base, &worker_cancel),
-            };
-            let reply = match result {
-                Ok(vm) => json!({"result":vm}),
-                Err(e) => json!({"error":e.to_string()}),
-            };
-            let _ = writeln!(stream, "{reply}");
+        self.spawn_import(stream, move |cancel| {
+            let vm = match source {
+                Some(id) => store.copy_machine(&id, settings.name, cancel),
+                None => store.create_machine(settings, &base, cancel),
+            }?;
+            Ok(serde_json::to_value(vm)?)
         });
-        self.imports.push(Import { cancel, worker });
     }
     fn list_machines(&self) -> Result<Value> {
         let mut result = Vec::new();
@@ -184,7 +265,7 @@ impl Manager {
             value["error"] = Value::Null;
             value["terminalReady"] = json!(false);
             if let Some((id, task)) = run {
-                let record = task.record.lock().unwrap();
+                let record = record_guard(&task.record);
                 value["runId"] = json!(id);
                 value["state"] = json!(record.state);
                 value["error"] = json!(record.error);
@@ -247,29 +328,35 @@ impl Manager {
         self.storage.machine(id)?;
         let run = self.machine_runs.get(id).ok_or("VM is stopped")?;
         let task = self.tasks.get(run).ok_or("VM is stopped")?;
-        let mut record = task.record.lock().unwrap();
         if task.worker.is_finished() {
+            let record = record_guard(&task.record);
             return Ok(json!({"state":record.state}));
         }
         if force {
             task.cancel.store(true, Ordering::Relaxed);
         } else {
-            if record.state == "stopping" {
-                return Ok(json!({"state":"stopping"}));
-            }
-            if record.state != "running" {
-                return Err("Wait until the VM has booted, or use Force stop".into());
+            {
+                let record = record_guard(&task.record);
+                if record.state == "stopping" {
+                    return Ok(json!({"state":"stopping"}));
+                }
+                if record.state != "running" {
+                    return Err("Wait until the VM has booted, or use Force stop".into());
+                }
             }
             linux::request_shutdown(run)?;
         }
-        record.state = "stopping".into();
-        Ok(json!({"state":"stopping"}))
+        let mut record = record_guard(&task.record);
+        if !task.worker.is_finished() {
+            record.state = "stopping".into();
+        }
+        Ok(json!({"state":record.state}))
     }
 
     fn import_disk(&mut self, request: Value, mut stream: UnixStream) {
         self.imports
             .retain_mut(|import| !import.worker.is_finished());
-        if self.imports.len() >= 4 {
+        if self.imports.len() >= MAX_IMPORTS {
             let _ = writeln!(
                 stream,
                 "{}",
@@ -278,35 +365,27 @@ impl Manager {
             return;
         }
         let store = self.storage.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let worker = thread::spawn(move || {
-            let response = (|| -> Result<Value> {
-                if request
-                    .as_object()
-                    .is_none_or(|r| r.keys().any(|k| !matches!(k.as_str(), "command" | "args")))
-                {
-                    return Err("unknown import request field".into());
-                }
-                let args =
-                    string_args(&request, "disk args are required", "invalid disk argument")?;
-                let values = sandbox::options(&args, &["--name", "--rootfs"])?;
-                store.create_cancellable(
-                    values.get("--name").ok_or("--name is required")?,
-                    Path::new(values.get("--rootfs").ok_or("--rootfs is required")?),
-                    &worker_cancel,
-                )
-            })();
-            let reply = match response {
-                Ok(result) => json!({"result":result}),
-                Err(e) => json!({"error":e.to_string()}),
-            };
-            let _ = writeln!(stream, "{reply}");
+        self.spawn_import(stream, move |cancel| {
+            if request
+                .as_object()
+                .is_none_or(|r| r.keys().any(|k| !matches!(k.as_str(), "command" | "args")))
+            {
+                return Err("unknown import request field".into());
+            }
+            let args = string_args(&request, "disk args are required", "invalid disk argument")?;
+            let values = sandbox::options(&args, &["--name", "--rootfs"])?;
+            store.create_cancellable(
+                values.get("--name").ok_or("--name is required")?,
+                Path::new(values.get("--rootfs").ok_or("--rootfs is required")?),
+                cancel,
+            )
         });
-        self.imports.push(Import { cancel, worker });
     }
 
-    fn launch(&mut self, args: &[String]) -> Result<Value> {
+    fn launch_request(
+        &self,
+        args: &[String],
+    ) -> Result<(RunRequest, Option<crate::storage::Lease>)> {
         if args
             .iter()
             .any(|a| matches!(a.as_str(), "--gateway-config" | "--cloud-hypervisor"))
@@ -329,7 +408,7 @@ impl Manager {
             .values()
             .filter(|t| !t.worker.is_finished())
             .count()
-            >= 4
+            >= MAX_ACTIVE_RUNS
         {
             return Err("four VMs are already active".into());
         }
@@ -341,7 +420,11 @@ impl Manager {
         if let Some(lease) = &disk_lease {
             request.rootfs = lease.path.clone();
         }
-        while self.tasks.len() >= 128 {
+        Ok((request, disk_lease))
+    }
+
+    fn trim_run_history(&mut self) -> Result<()> {
+        while self.tasks.len() >= MAX_RUN_HISTORY {
             let id = self
                 .tasks
                 .iter()
@@ -351,41 +434,18 @@ impl Manager {
             let task = self.tasks.remove(&id).ok_or("completed run disappeared")?;
             let _ = task.worker.join();
         }
+        Ok(())
+    }
+
+    fn launch(&mut self, args: &[String]) -> Result<Value> {
+        let (request, disk_lease) = self.launch_request(args)?;
+        self.trim_run_history()?;
         let id = linux::new_run_id()?;
-        let record = Arc::new(Mutex::new(Record {
-            profile: request.agent_profile_id.clone(),
-            saved_disk: request.saved_disk.clone(),
-            storage_mode: if request.preparation {
-                "prepare"
-            } else {
-                "runtime"
-            },
-            setup_mode: request.setup_mode,
-            state: "queued".into(),
-            error: None,
-            console: VecDeque::new(),
-            console_total: 0,
-            terminal: None,
-        }));
+        let record = Arc::new(Mutex::new(Record::new(&request)));
         let cancel = Arc::new(AtomicBool::new(false));
         let events = Arc::clone(&record);
         let event: EventSink = Arc::new(move |event| {
-            let mut record = events.lock().unwrap();
-            match event {
-                RunEvent::State(state) => {
-                    if record.state != "stopping" {
-                        record.state = state.into();
-                    }
-                }
-                RunEvent::Console(bytes) => {
-                    record.console_total += bytes.len() as u64;
-                    record.console.extend(bytes);
-                    while record.console.len() > CONSOLE_LIMIT {
-                        record.console.pop_front();
-                    }
-                }
-                RunEvent::Terminal(stream) => record.terminal = Some(stream),
-            }
+            record_guard(&events).apply(event);
         });
         let backend = self.backend.clone();
         let runner = Arc::clone(&self.runner);
@@ -399,16 +459,7 @@ impl Manager {
             }));
             let result =
                 result.unwrap_or_else(|_| Err("VM worker panicked; inspect gateway logs".into()));
-            let mut record = finished.lock().unwrap();
-            record.terminal = None;
-            match result {
-                Ok(()) => record.state = "stopped".into(),
-                Err(error) if error == "run interrupted" => record.state = "stopped".into(),
-                Err(error) => {
-                    record.state = "failed".into();
-                    record.error = Some(error);
-                }
-            }
+            record_guard(&finished).finish(result);
         })?;
         self.tasks.insert(
             id.clone(),
@@ -423,7 +474,7 @@ impl Manager {
 
     fn terminal_read(&self, id: &str, request: &Value) -> Result<Value> {
         let task = self.tasks.get(id).ok_or("unknown VM run")?;
-        let record = task.record.lock().unwrap();
+        let record = record_guard(&task.record);
         let offset = request["offset"].as_u64().ok_or("offset is required")?;
         if offset > record.console_total {
             return Err("terminal offset is ahead of output".into());
@@ -454,7 +505,7 @@ impl Manager {
 
     fn terminal_write(&self, id: &str, request: &Value) -> Result<Value> {
         let task = self.tasks.get(id).ok_or("unknown VM run")?;
-        let mut record = task.record.lock().unwrap();
+        let mut record = record_guard(&task.record);
         let data = request["data"]
             .as_array()
             .ok_or("terminal bytes are required")?;
@@ -510,7 +561,7 @@ impl Manager {
             self.tasks
                 .iter()
                 .map(|(id, task)| {
-                    let record = task.record.lock().unwrap();
+                    let record = record_guard(&task.record);
                     json!({
                         "id": id,
                         "agentProfileId": record.profile,
@@ -527,7 +578,7 @@ impl Manager {
 
     fn run_logs(&self, id: &str) -> Result<Value> {
         let task = self.tasks.get(id).ok_or("unknown VM run")?;
-        let record = task.record.lock().unwrap();
+        let record = record_guard(&task.record);
         let console = record.console.iter().copied().collect::<Vec<_>>();
         Ok(json!({
             "id": id,
@@ -542,7 +593,7 @@ impl Manager {
 
     fn stop_run(&self, id: &str) -> Result<Value> {
         let task = self.tasks.get(id).ok_or("unknown VM run")?;
-        let mut record = task.record.lock().unwrap();
+        let mut record = record_guard(&task.record);
         if !task.worker.is_finished() {
             task.cancel.store(true, Ordering::Relaxed);
             record.state = "stopping".into();
@@ -614,9 +665,7 @@ impl Manager {
                 let id = request["id"].as_str().ok_or("run ID is required")?;
                 self.stop_run(id)
             }
-            _ => {
-                Err("expected create-disk, list-disks, launch, list, logs, stop-vm, or stop".into())
-            }
+            _ => Err("unknown gateway command".into()),
         }
     }
     fn shutdown(&mut self) {

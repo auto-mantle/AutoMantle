@@ -206,19 +206,52 @@ pub fn audit_event(
     meta: &Metadata,
     packets: u64,
     bytes: u64,
-) -> Value {
-    let id = crate::linux::new_run_id().expect("host random source unavailable");
-    let hex = id.strip_prefix("automantle-vm-").unwrap();
-    let uuid = format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    );
-    json!({"requestId":uuid,"agentProfileId":profile,"runId":run,"reason":decision.reason(),
+) -> Result<Value> {
+    let uuid = crate::linux::new_uuid()?;
+    Ok(
+        json!({"requestId":uuid,"agentProfileId":profile,"runId":run,"reason":decision.reason(),
         "etherType":meta.ether_type,"protocol":meta.protocol,"sourceIp":meta.source,
         "destinationIp":meta.destination,"sourcePort":meta.source_port,"destinationPort":meta.destination_port,
-        "packetCount":packets,"byteCount":bytes})
+        "packetCount":packets,"byteCount":bytes}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Decision, NetworkPolicy};
+    use crate::sandbox::VmNetwork;
+
+    fn policy() -> NetworkPolicy {
+        NetworkPolicy::new(&VmNetwork {
+            tap: "tap0".into(),
+            host_ip: "10.0.0.1".into(),
+            guest_ip: "10.0.0.2".into(),
+            guest_mac: "02:00:00:00:00:02".into(),
+            host_mac: "02:00:00:00:00:01".into(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn arp_requires_the_guest_identity_and_host_target() {
+        let mut frame = vec![
+            0x02, 0, 0, 0, 0, 1, // destination MAC
+            0x02, 0, 0, 0, 0, 2, // source MAC
+            0x08, 0x06, // ARP
+            0, 1, 0x08, 0, 6, 4, 0, 1, // Ethernet/IPv4 request
+            0x02, 0, 0, 0, 0, 2, // sender MAC
+            10, 0, 0, 2, // sender IP
+            0, 0, 0, 0, 0, 0, // target MAC
+            10, 0, 0, 1, // target IP
+        ];
+        assert_eq!(policy().evaluate(&frame).0, Decision::LinkControl);
+
+        frame[22] = 0x04;
+        assert_eq!(policy().evaluate(&frame).0, Decision::Spoofed);
+    }
+
+    #[test]
+    fn truncated_ethernet_frame_is_malformed() {
+        assert_eq!(policy().evaluate(&[0; 13]).0, Decision::Malformed);
+    }
 }

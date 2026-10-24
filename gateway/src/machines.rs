@@ -1,6 +1,6 @@
 use crate::{
     linux,
-    sandbox::{Result, valid_disk_name},
+    sandbox::{Result, valid_disk_name, valid_uuid},
     storage::Store,
 };
 use serde::{Deserialize, Serialize};
@@ -30,16 +30,7 @@ impl Settings {
         {
             return Err("VM name must contain 1-80 characters without control characters".into());
         }
-        let profile = &self.agent_profile_id;
-        if profile.len() != 36
-            || !profile.bytes().enumerate().all(|(i, b)| {
-                if matches!(i, 8 | 13 | 18 | 23) {
-                    b == b'-'
-                } else {
-                    b.is_ascii_hexdigit()
-                }
-            })
-        {
+        if !valid_uuid(&self.agent_profile_id) {
             return Err("Choose an existing Agent Profile".into());
         }
         if !(128..=65536).contains(&self.memory_mib) || !(1..=64).contains(&self.vcpu_count) {

@@ -256,3 +256,33 @@ pub(super) fn response_line(upstream: &mut impl Read) -> Result<Vec<u8>> {
     }
     Err("response line too long".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::response_framing;
+
+    #[test]
+    fn ambiguous_upstream_framing_is_rejected() {
+        assert!(
+            response_framing(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n",
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            response_framing(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n",
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn protected_responses_reject_compression() {
+        let header = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
+        assert!(response_framing(header, true).is_err());
+        assert!(response_framing(header, false).is_ok());
+    }
+}

@@ -21,7 +21,6 @@ use std::{
 };
 
 const STATE: &str = "/run/automantle-helper/state";
-const RUN_PREFIX: &str = "automantle-vm-";
 
 fn run_path(id: &str) -> Result<PathBuf> {
     if !linux::valid_run_id(id) {
@@ -49,8 +48,7 @@ pub(super) fn active(id: &str) -> Result<PathBuf> {
 }
 
 fn user(id: &str) -> Result<String> {
-    let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
-    run_path(id)?;
+    let suffix = linux::run_suffix(id)?;
     Ok(format!("amv{}", &suffix[..10]))
 }
 
@@ -254,7 +252,7 @@ pub(super) fn start_vmm(id: &str, settings: &serde_json::Value) -> Result<()> {
         return Err("invalid VMM request fields".into());
     }
     if networking {
-        let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
+        let suffix = linux::run_suffix(id)?;
         let table = format!("am_{}", &suffix[..16]);
         let tap = format!("amt{}", &suffix[..10]);
         checked(Command::new("/usr/sbin/nft").args(["list", "table", "inet", &table]))?;

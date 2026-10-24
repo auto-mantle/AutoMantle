@@ -52,7 +52,7 @@ fn print_usage() {
   automantle-gateway terminal RUN_ID
   automantle-gateway stop-vm RUN_ID
   automantle-gateway stop
-automantle-gateway version
+  automantle-gateway version
 
 Start runs as the automantle service user and requires the installed root helper.
 The installer provides systemd units for both services; launch commands use the running gateway.
@@ -64,7 +64,7 @@ Options:
   --disk-directory PATH     Private VM environments, start only (default: /var/lib/automantle/vms)
   --default-kernel PATH     Host standard kernel for saved VMs, start only
   --default-rootfs PATH     Clean Linux template for new VMs, start only
-  --tls-ca-config PATH      Start: default host HTTPS CA for saved VMs; launch: per-run CA
+  --tls-ca-config PATH      Start: default host HTTPS CA; launch: per-run CA
   --saved-disk NAME         Use a saved installation instead of --rootfs
   --storage-mode MODE       runtime (private writable copy) or prepare (write saved disk)
   --initramfs PATH          Optional initrd with guest boot drivers
@@ -75,7 +75,6 @@ Options:
   --scratch-mib NUMBER     Blank private disk size without a template (default: 64)
   --network MODE           disabled or proxy (default: disabled)
   --mode MODE              normal or setup (default: normal; setup requires proxy)
-  --tls-ca-config PATH     Optional host CA configuration enabling inspected HTTPS
   --credentials-config PATH Host-only HTTPS header credential bindings
   --agent-profile-id UUID  Existing Agent Profile, mandatory for every VM
   --cmdline TEXT           Guest boot arguments (saved disks default to rw; other roots to ro)
@@ -96,7 +95,7 @@ Shared-host-folder, passthrough, and arbitrary VMM options are not exposed."
 }
 
 pub(crate) fn options(args: &[String], allowed: &[&str]) -> Result<BTreeMap<String, String>> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err("each option requires a value".into());
     }
     let mut result = BTreeMap::new();
@@ -185,13 +184,13 @@ impl RunRequest {
         if values.contains_key("--rootfs") == saved_disk.is_some() {
             return Err("choose exactly one of --rootfs or --saved-disk".into());
         }
-        if let Some(name) = &saved_disk {
-            if !valid_disk_name(name) {
-                return Err(
-                    "saved disk names require 1-64 ASCII letters, digits, hyphens or underscores"
-                        .into(),
-                );
-            }
+        if let Some(name) = &saved_disk
+            && !valid_disk_name(name)
+        {
+            return Err(
+                "saved disk names require 1-64 ASCII letters, digits, hyphens or underscores"
+                    .into(),
+            );
         }
         let storage_mode = values
             .get("--storage-mode")
@@ -237,15 +236,7 @@ impl RunRequest {
             .get("--agent-profile-id")
             .cloned()
             .ok_or("every VM requires an Agent Profile; the running gateway supplies its connection config")?;
-        if agent_profile_id.len() != 36
-            || !agent_profile_id.bytes().enumerate().all(|(i, b)| {
-                if [8, 13, 18, 23].contains(&i) {
-                    b == b'-'
-                } else {
-                    b.is_ascii_hexdigit()
-                }
-            })
-        {
+        if !valid_uuid(&agent_profile_id) {
             return Err("--agent-profile-id must be a UUID".into());
         }
         if network != "proxy" && tls_ca_config.is_some() {
@@ -332,6 +323,17 @@ pub(crate) fn valid_disk_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+pub(crate) fn valid_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(target_os = "linux", derive(serde::Serialize, serde::Deserialize))]
 pub struct VmNetwork {
@@ -366,4 +368,43 @@ fn doctor(_: &Path) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn manager_cli(_: &[String]) -> Result<()> {
     doctor(Path::new(""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunRequest, valid_uuid};
+
+    #[test]
+    fn profile_ids_have_exact_uuid_shape() {
+        assert!(valid_uuid("12345678-1234-1234-1234-123456789abc"));
+        assert!(valid_uuid("ABCDEF12-1234-1234-1234-123456789ABC"));
+        assert!(!valid_uuid("12345678-1234-1234-1234-123456789ab"));
+        assert!(!valid_uuid("12345678_1234-1234-1234-123456789abc"));
+        assert!(!valid_uuid("12345678-1234-1234-1234-123456789abg"));
+    }
+
+    #[test]
+    fn launch_options_require_one_root_and_explicit_proxy_for_setup() {
+        let base = [
+            "--kernel",
+            "/kernel",
+            "--rootfs",
+            "/rootfs",
+            "--gateway-config",
+            "/gateway.json",
+            "--agent-profile-id",
+            "12345678-1234-1234-1234-123456789abc",
+        ];
+        let args = |extra: &[&str]| {
+            base.iter()
+                .chain(extra)
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(RunRequest::parse(&args(&[])).is_ok());
+        assert!(RunRequest::parse(&args(&["--saved-disk", "saved"])).is_err());
+        assert!(RunRequest::parse(&args(&["--mode", "setup"])).is_err());
+        assert!(RunRequest::parse(&args(&["--mode", "setup", "--network", "proxy"])).is_ok());
+    }
 }

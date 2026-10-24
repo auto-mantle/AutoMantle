@@ -9,12 +9,13 @@ pub(super) fn forward_observed(
     upstream: &mut (impl Read + Write),
     request: &Request,
     context: &Context,
+    secure: bool,
     mut observation: Option<&mut Observation>,
 ) -> Result<()> {
-    if let Some(event) = observation.as_deref_mut() {
-        if !event.request_active(client) {
-            return Ok(());
-        }
+    if let Some(event) = observation.as_deref_mut()
+        && !event.request_active(client)
+    {
+        return Ok(());
     }
     if !context.active() {
         return Ok(());
@@ -36,7 +37,7 @@ pub(super) fn forward_observed(
         &request.host,
         &request.method,
         &request.path,
-        true,
+        secure,
     ) {
         if let Some(event) = observation.as_deref_mut() {
             event.report("CREDENTIAL_BINDING_DENIED");
@@ -148,13 +149,13 @@ fn send_upstream_response(
     request: &Request,
     context: &Context,
     authenticated: bool,
-    mut observation: Option<&mut Observation>,
+    observation: Option<&mut Observation>,
 ) -> Result<()> {
     if authenticated {
         let (response, decoded) = match credential_response(upstream, &request.method) {
             Ok(response) => response,
             Err(_) => {
-                if let Some(event) = observation.as_deref_mut() {
+                if let Some(event) = observation {
                     event.report("RESPONSE_BLOCKED");
                 }
                 return reply(client, 502, "credential response framing failed");
@@ -166,7 +167,7 @@ fn send_upstream_response(
         if context.credentials.contains_secret(&response)
             || context.credentials.contains_secret(&decoded)
         {
-            if let Some(event) = observation.as_deref_mut() {
+            if let Some(event) = observation {
                 event.report("RESPONSE_BLOCKED");
             }
             return reply(client, 502, "credential response blocked");

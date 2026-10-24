@@ -40,6 +40,16 @@ pub struct Proxy {
     thread: Option<JoinHandle<()>>,
     context: Arc<Context>,
 }
+pub(crate) struct ProxyConfig<'a> {
+    pub bind_ip: &'a str,
+    pub backend: Backend,
+    pub profile: String,
+    pub tls: Option<Tls>,
+    pub credentials: Credentials,
+    pub cancelled: Arc<AtomicBool>,
+    pub deadline: Instant,
+    pub setup_mode: bool,
+}
 #[derive(Clone)]
 struct Context {
     setup_session: Option<String>,
@@ -71,16 +81,23 @@ impl Proxy {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
     }
-    pub fn start(
-        bind_ip: &str,
-        backend: Backend,
-        profile: String,
-        tls: Option<Tls>,
-        credentials: Credentials,
-        cancelled: Arc<AtomicBool>,
-        deadline: Instant,
-        setup_mode: bool,
-    ) -> Result<Self> {
+    pub fn check(&self) -> Result<()> {
+        if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Err("HTTP inspection proxy stopped unexpectedly".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn start(config: ProxyConfig<'_>) -> Result<Self> {
+        let ProxyConfig {
+            bind_ip,
+            backend,
+            profile,
+            tls,
+            credentials,
+            cancelled,
+            deadline,
+            setup_mode,
+        } = config;
         let listener = TcpListener::bind((bind_ip, PROXY_PORT))?;
         listener.set_nonblocking(true)?;
         let stopped = Arc::new(AtomicBool::new(false));
@@ -100,40 +117,62 @@ impl Proxy {
             deadline,
         });
         let setup_context = Arc::clone(&context);
-        let thread = thread::spawn(move || {
-            let mut workers: Vec<JoinHandle<()>> = Vec::new();
-            while context.active() {
-                let mut i = 0;
-                while i < workers.len() {
-                    if workers[i].is_finished() {
-                        let _ = workers.swap_remove(i).join();
-                    } else {
-                        i += 1;
-                    }
-                }
-                match listener.accept() {
-                    Ok((mut client, _)) => {
-                        if workers.len() >= 16 {
-                            let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
-                            let _ = reply(&mut client, 503, "proxy request limit reached");
-                            continue;
+        let worker = thread::Builder::new()
+            .name("vm-http-proxy".into())
+            .spawn(move || {
+                let mut workers: Vec<JoinHandle<()>> = Vec::new();
+                while context.active() {
+                    let mut i = 0;
+                    while i < workers.len() {
+                        if workers[i].is_finished() {
+                            let _ = workers.swap_remove(i).join();
+                        } else {
+                            i += 1;
                         }
-                        let context = Arc::clone(&context);
-                        workers.push(thread::spawn(move || {
-                            let _ = handle(client, &context);
-                        }));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20))
+                    match listener.accept() {
+                        Ok((mut client, _)) => {
+                            if workers.len() >= 16 {
+                                let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
+                                let _ = reply(&mut client, 503, "proxy request limit reached");
+                                continue;
+                            }
+                            let context = Arc::clone(&context);
+                            match thread::Builder::new().spawn(move || {
+                                let _ = handle(client, &context);
+                            }) {
+                                Ok(worker) => workers.push(worker),
+                                Err(error) => {
+                                    eprintln!("HTTP proxy worker could not start: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(20))
+                        }
+                        Err(error) => {
+                            eprintln!("HTTP proxy accept failed: {error}");
+                            break;
+                        }
                     }
-                    Err(_) => break,
                 }
+                context.stopped.store(true, Ordering::Relaxed);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+            });
+        let thread = match worker {
+            Ok(thread) => thread,
+            Err(error) => {
+                if let Some(id) = &setup_context.setup_session {
+                    setup_context
+                        .backend
+                        .finish_setup(&setup_context.profile, id);
+                }
+                return Err(error.into());
             }
-            context.stopped.store(true, Ordering::Relaxed);
-            for worker in workers {
-                let _ = worker.join();
-            }
-        });
+        };
         Ok(Self {
             stopped,
             thread: Some(thread),
@@ -155,7 +194,7 @@ impl Drop for Proxy {
 
 enum Client {
     Plain(Socket),
-    Tls(crate::tls::Downstream),
+    Tls(Box<crate::tls::Downstream>),
 }
 impl Client {
     fn socket(&mut self) -> &mut Socket {
@@ -296,7 +335,7 @@ fn handle_observed(
         let raw = read_header(&mut stream)?;
         observation.capture(&raw, Some(&outer.host));
         let parsed = parse_request(&raw, Some(&outer.host));
-        (Client::Tls(stream), parsed, true)
+        (Client::Tls(Box::new(stream)), parsed, true)
     } else {
         (Client::Plain(socket), Ok(outer), false)
     };
@@ -372,7 +411,7 @@ fn serve(
         );
     }
     let credential_plan = request.credential_plan(&context.credentials);
-    let action = request.reviewed_action(&context.credentials);
+    let action = request.reviewed_action(&context.credentials, credential_plan.as_deref().ok());
     let lifecycle = RequestLifecycle::new(&context.stopped, &context.cancelled, context.deadline);
     match context.backend.authorize_action_recorded(
         &context.profile,
@@ -486,18 +525,24 @@ fn serve(
     let transfer_time = Duration::from_secs(300);
     client.socket().phase(transfer_time);
     let result = if secure {
-        match context
-            .tls
-            .as_ref()
-            .unwrap()
-            .connect(upstream, &request.host)
-        {
+        let Some(tls) = context.tls.as_ref() else {
+            observation.report("HTTPS_DISABLED");
+            return reply(client, 503, "HTTPS inspection is not enabled");
+        };
+        match tls.connect(upstream, &request.host) {
             Ok(mut upstream) => {
                 upstream.sock.phase(transfer_time);
                 if !observation.request_active(client) {
                     return Ok(());
                 }
-                forward_observed(client, &mut upstream, request, context, Some(observation))
+                forward_observed(
+                    client,
+                    &mut upstream,
+                    request,
+                    context,
+                    secure,
+                    Some(observation),
+                )
             }
             Err(_) => {
                 observation.report("UPSTREAM_TLS_FAILED");
@@ -506,7 +551,14 @@ fn serve(
         }
     } else {
         upstream.phase(transfer_time);
-        forward_observed(client, &mut upstream, request, context, Some(observation))
+        forward_observed(
+            client,
+            &mut upstream,
+            request,
+            context,
+            secure,
+            Some(observation),
+        )
     };
     if !observation.terminal {
         observation.report(if !context.active() {

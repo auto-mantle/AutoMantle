@@ -37,7 +37,7 @@ struct Issuer {
     certificate: Certificate,
     not_before: OffsetDateTime,
     not_after: OffsetDateTime,
-    cache: BTreeMap<String, Arc<ServerConfig>>,
+    cache: BTreeMap<String, (OffsetDateTime, Arc<ServerConfig>)>,
 }
 pub struct Tls {
     issuer: Mutex<Issuer>,
@@ -165,10 +165,11 @@ impl Tls {
         if !constraints.value.ca || !usage.value.key_cert_sign() {
             return Err("certificate is not authorized to sign".into());
         }
-        if let Some(usage) = parsed.extended_key_usage()? {
-            if !usage.value.any && !usage.value.server_auth {
-                return Err("CA does not permit server authentication".into());
-            }
+        if let Some(usage) = parsed.extended_key_usage()?
+            && !usage.value.any
+            && !usage.value.server_auth
+        {
+            return Err("CA does not permit server authentication".into());
         }
         let key = KeyPair::from_pem(key)?;
         if key.public_key_der() != parsed.public_key().raw {
@@ -202,17 +203,21 @@ impl Tls {
         if now < issuer.not_before || now >= issuer.not_after || Instant::now() >= self.deadline {
             return Err("CA or VM lifetime expired".into());
         }
-        if let Some(config) = issuer.cache.get(host) {
+        if let Some((expires, config)) = issuer.cache.get(host)
+            && now < *expires
+        {
             return Ok(Arc::clone(config));
         }
+        issuer.cache.remove(host);
         let mut params = CertificateParams::new(vec![host.to_owned()])?;
         params.not_before = (now - time::Duration::minutes(5)).max(issuer.not_before);
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         params.not_after = (now
-            + time::Duration::seconds(remaining.as_secs().max(1).min(86400) as i64))
+            + time::Duration::seconds(remaining.as_secs().clamp(1, 86400) as i64))
         .min(issuer.not_after);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let expires = params.not_after;
         let key = KeyPair::generate()?;
         let certificate = params.signed_by(&key, &issuer.certificate, &issuer.key)?;
         let private = PrivateKeyDer::Pkcs8(key.serialize_der().into());
@@ -227,7 +232,9 @@ impl Tls {
         if issuer.cache.len() >= 64 {
             issuer.cache.pop_first();
         }
-        issuer.cache.insert(host.to_owned(), Arc::clone(&config));
+        issuer
+            .cache
+            .insert(host.to_owned(), (expires, Arc::clone(&config)));
         Ok(config)
     }
     pub fn accept(&self, mut socket: Socket, host: &str) -> Result<Downstream> {
@@ -287,6 +294,17 @@ pub fn initialize(directory: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     use std::os::unix::fs::DirBuilderExt;
     builder.mode(0o700).create(directory)?;
+    let result = write_ca(directory);
+    if result.is_err() {
+        for name in ["ca-key.pem", "ca.pem", "tls.json"] {
+            let _ = fs::remove_file(directory.join(name));
+        }
+        let _ = fs::remove_dir(directory);
+    }
+    result
+}
+
+fn write_ca(directory: &Path) -> Result<()> {
     let key = KeyPair::generate()?;
     let mut params = CertificateParams::default();
     let now = OffsetDateTime::now_utc();

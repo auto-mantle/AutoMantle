@@ -41,15 +41,42 @@ pub enum RunEvent {
 pub type EventSink = Arc<dyn Fn(RunEvent) + Send + Sync>;
 
 pub fn valid_run_id(id: &str) -> bool {
-    id.strip_prefix(RUN_PREFIX)
-        .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    run_suffix(id).is_ok()
 }
-pub fn new_run_id() -> Result<String> {
+pub(crate) fn run_suffix(id: &str) -> Result<&str> {
+    let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
+    if suffix.len() != 32 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid run ID".into());
+    }
+    Ok(suffix)
+}
+fn random_id_bytes() -> Result<[u8; 16]> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+pub fn new_run_id() -> Result<String> {
+    let bytes = random_id_bytes()?;
     Ok(format!(
         "{RUN_PREFIX}{}",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ))
+}
+pub(crate) fn new_uuid() -> Result<String> {
+    let mut bytes = random_id_bytes()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
     ))
 }
 const MAX_IMAGE: u64 = 64 * 1024 * 1024 * 1024;
@@ -204,6 +231,9 @@ impl Run {
     }
 
     fn pump_console(&mut self) -> Result<()> {
+        if let Some(proxy) = &self.proxy {
+            proxy.check()?;
+        }
         if let Some(gate) = self.network.as_ref().and_then(|n| n.gate.as_ref()) {
             gate.check()?;
         }
@@ -260,10 +290,10 @@ impl Run {
         if let Err(error) = self.release_persistent_root() {
             errors.push(format!("saved disk: {error}"));
         }
-        if self.persistent_root.is_none() {
-            if let Err(error) = self.remove_runtime_root() {
-                errors.push(format!("runtime disk: {error}"));
-            }
+        if self.persistent_root.is_none()
+            && let Err(error) = self.remove_runtime_root()
+        {
+            errors.push(format!("runtime disk: {error}"));
         }
         if let Some(network) = self.network.as_mut() {
             match network.remove() {
@@ -355,16 +385,16 @@ pub fn run(
         )?;
         let host_ip = network.config().host_ip.clone();
         vm.network = Some(network);
-        vm.proxy = Some(Proxy::start(
-            &host_ip,
+        vm.proxy = Some(Proxy::start(crate::proxy::ProxyConfig {
+            bind_ip: &host_ip,
             backend,
-            request.agent_profile_id.clone(),
+            profile: request.agent_profile_id.clone(),
             tls,
             credentials,
-            Arc::clone(&cancelled),
+            cancelled: Arc::clone(&cancelled),
             deadline,
-            request.setup_mode,
-        )?);
+            setup_mode: request.setup_mode,
+        })?);
         eprintln!("run={} proxy=http://{}:3128", vm.id, host_ip);
     }
     eprintln!(
@@ -538,11 +568,8 @@ pub(crate) fn copy_image(
 }
 
 pub(crate) fn remove_run_directory(directory: &Path, id: &str) -> Result<()> {
-    let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
-    if suffix.len() != 32
-        || !suffix.bytes().all(|b| b.is_ascii_hexdigit())
-        || directory != Path::new("/run").join(id)
-    {
+    run_suffix(id)?;
+    if directory != Path::new("/run").join(id) {
         return Err("refusing cleanup outside the exact run directory".into());
     }
     match fs::symlink_metadata(directory) {
@@ -585,4 +612,26 @@ fn remove_exact_directory(directory: &Path) -> Result<()> {
     }
     fs::remove_dir_all(directory)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{new_uuid, run_suffix};
+
+    #[test]
+    fn run_suffix_requires_a_complete_hex_identifier() {
+        let id = "automantle-vm-0123456789abcdef0123456789abcdef";
+        assert_eq!(run_suffix(id).unwrap(), "0123456789abcdef0123456789abcdef");
+        assert!(run_suffix("automantle-vm-0123456789abcdef").is_err());
+        assert!(run_suffix("automantle-vm-0123456789abcdef0123456789abcdeg").is_err());
+        assert!(run_suffix("vm-0123456789abcdef0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn generated_uuid_has_v4_version_and_variant() {
+        let id = new_uuid().unwrap();
+        assert!(crate::sandbox::valid_uuid(&id));
+        assert_eq!(id.as_bytes()[14], b'4');
+        assert!(b"89ab".contains(&id.as_bytes()[19]));
+    }
 }

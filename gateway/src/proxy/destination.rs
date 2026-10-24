@@ -35,9 +35,10 @@ pub(super) fn resolve(host: &str, port: u16, context: &Context) -> Result<Vec<So
     Err("DNS timed out or cancelled".into())
 }
 
-pub(super) fn parse_target(target: &str) -> Option<(String, String)> {
-    let (host, target) = http_origin(target)?;
-    Some((host, target.split('?').next()?.to_owned()))
+pub(super) fn parse_target(target: &str) -> Option<(String, String, String)> {
+    let (host, origin) = http_origin(target)?;
+    let path = origin.split('?').next()?.to_owned();
+    Some((host, path, origin))
 }
 pub(super) fn http_origin(target: &str) -> Option<(String, String)> {
     let rest = target.strip_prefix("http://")?;
@@ -82,4 +83,26 @@ pub(super) fn public_ipv4_destinations(mut addresses: Vec<SocketAddr>) -> Option
     addresses.retain(SocketAddr::is_ipv4);
     (!addresses.is_empty() && addresses.iter().all(|address| public_address(address.ip())))
         .then_some(addresses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{public_address, public_ipv4_destinations};
+
+    #[test]
+    fn special_use_destinations_are_blocked() {
+        for address in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "192.0.0.9"] {
+            assert!(!public_address(address.parse().unwrap()));
+        }
+        assert!(public_address("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn mixed_public_and_private_dns_answers_are_rejected() {
+        let addresses = vec![
+            "8.8.8.8:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        assert!(public_ipv4_destinations(addresses).is_none());
+    }
 }

@@ -15,22 +15,7 @@ pub(super) struct Observation<'a> {
 }
 impl<'a> Observation<'a> {
     pub(super) fn new(context: &'a Context) -> Result<Self> {
-        use ring::rand::SecureRandom;
-        let mut bytes = [0u8; 16];
-        ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| "request tracking unavailable")?;
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let id = format!(
-            "{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        );
+        let id = crate::linux::new_uuid().map_err(|_| "request tracking unavailable")?;
         Ok(Self {
             context,
             id,
@@ -86,23 +71,24 @@ impl<'a> Observation<'a> {
             self.port = Some(443);
             self.path = valid_path(target).then(|| target.to_owned());
         } else if method == "CONNECT" {
-            if let Some((host, port)) = target.rsplit_once(':') {
-                if valid_host(host) && port == "443" {
-                    self.host = Some(host.to_ascii_lowercase());
-                    self.port = Some(443);
-                }
+            if let Some((host, port)) = target.rsplit_once(':')
+                && valid_host(host)
+                && port == "443"
+            {
+                self.host = Some(host.to_ascii_lowercase());
+                self.port = Some(443);
             }
-        } else if let Ok(url) = reqwest::Url::parse(target) {
-            if url.scheme() == "http" && url.username().is_empty() && url.password().is_none() {
-                if let Some(host) = url.host_str().filter(|host| valid_host(host)) {
-                    self.host = Some(host.to_ascii_lowercase());
-                    self.port = Some(url.port().unwrap_or(80));
-                    self.path = (url.query().is_none()
-                        && url.fragment().is_none()
-                        && valid_path(url.path()))
+        } else if let Ok(url) = reqwest::Url::parse(target)
+            && url.scheme() == "http"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && let Some(host) = url.host_str().filter(|host| valid_host(host))
+        {
+            self.host = Some(host.to_ascii_lowercase());
+            self.port = Some(url.port().unwrap_or(80));
+            self.path =
+                (url.query().is_none() && url.fragment().is_none() && valid_path(url.path()))
                     .then(|| url.path().to_owned());
-                }
-            }
         }
     }
     pub(super) fn report(&mut self, reason: &str) {

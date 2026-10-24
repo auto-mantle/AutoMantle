@@ -1,4 +1,4 @@
-use super::{RUN_PREFIX, checked, command};
+use super::{checked, command, run_suffix};
 use crate::sandbox::{Result, VmNetwork};
 use std::{
     fs::{self, File},
@@ -24,7 +24,7 @@ impl HostNetwork {
         if !Path::new("/usr/sbin/tc").is_file() {
             return Err("--network proxy requires tc (/usr/sbin/tc)".into());
         }
-        let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
+        let suffix = run_suffix(id)?;
         let tap = format!("amt{}", &suffix[..10]);
         let table = format!("am_{}", &suffix[..16]);
         let mut random = [0_u8; 4];
@@ -83,7 +83,7 @@ impl HostNetwork {
             "mode",
             "tap",
             "user",
-            &vmm_user,
+            vmm_user,
         ]));
         if let Err(error) = tap_result {
             let _ = network.remove();
@@ -181,10 +181,7 @@ impl HostNetwork {
     }
 
     pub(crate) fn remove_by_id(id: &str) -> Result<()> {
-        let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
-        if !crate::linux::valid_run_id(id) {
-            return Err("invalid run ID".into());
-        }
+        let suffix = run_suffix(id)?;
         let mut network = Self {
             config: VmNetwork {
                 tap: format!("amt{}", &suffix[..10]),
@@ -209,12 +206,12 @@ impl HostNetwork {
             checked(Command::new("/usr/sbin/nft").args(args)).map(|_| ())
         };
         run(&["add", "table", "inet", &self.table])?;
-        let input = format!("{{ type filter hook input priority -300; policy accept; }}");
-        let forward = format!("{{ type filter hook forward priority -300; policy accept; }}");
-        let output = format!("{{ type filter hook output priority -300; policy accept; }}");
-        run(&["add", "chain", "inet", &self.table, "input", &input])?;
-        run(&["add", "chain", "inet", &self.table, "forward", &forward])?;
-        run(&["add", "chain", "inet", &self.table, "output", &output])?;
+        let input = "{ type filter hook input priority -300; policy accept; }";
+        let forward = "{ type filter hook forward priority -300; policy accept; }";
+        let output = "{ type filter hook output priority -300; policy accept; }";
+        run(&["add", "chain", "inet", &self.table, "input", input])?;
+        run(&["add", "chain", "inet", &self.table, "forward", forward])?;
+        run(&["add", "chain", "inet", &self.table, "output", output])?;
         for chain in ["input", "forward"] {
             run(&[
                 "add",
@@ -275,19 +272,17 @@ impl HostNetwork {
             &uid,
             "drop",
         ])?;
-        for name in [&self.capture_tap] {
-            for chain in ["input", "forward"] {
-                run(&[
-                    "add",
-                    "rule",
-                    "inet",
-                    &self.table,
-                    chain,
-                    "iifname",
-                    name,
-                    "drop",
-                ])?;
-            }
+        for chain in ["input", "forward"] {
+            run(&[
+                "add",
+                "rule",
+                "inet",
+                &self.table,
+                chain,
+                "iifname",
+                &self.capture_tap,
+                "drop",
+            ])?;
         }
         Ok(())
     }

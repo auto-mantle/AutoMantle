@@ -47,52 +47,52 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>> 
         if bytes.len() > MAX_RESPONSE {
             return Err("API response is too large".into());
         }
-        if framing.is_none() {
-            if let Some(index) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
-                let header = std::str::from_utf8(&bytes[..index])?;
-                let status = header
-                    .lines()
-                    .next()
-                    .and_then(|s| s.split_whitespace().nth(1))
-                    .ok_or("missing HTTP status")?
-                    .parse::<u16>()?;
-                let mut length = None;
-                for line in header.lines().skip(1) {
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.eq_ignore_ascii_case("transfer-encoding") {
-                            return Err("unsupported API transfer encoding".into());
+        if framing.is_none()
+            && let Some(index) = bytes.windows(4).position(|s| s == b"\r\n\r\n")
+        {
+            let header = std::str::from_utf8(&bytes[..index])?;
+            let status = header
+                .lines()
+                .next()
+                .and_then(|s| s.split_whitespace().nth(1))
+                .ok_or("missing HTTP status")?
+                .parse::<u16>()?;
+            let mut length = None;
+            for line in header.lines().skip(1) {
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("transfer-encoding") {
+                        return Err("unsupported API transfer encoding".into());
+                    }
+                    if name.eq_ignore_ascii_case("content-length") {
+                        if length.is_some() {
+                            return Err("duplicate API content length".into());
                         }
-                        if name.eq_ignore_ascii_case("content-length") {
-                            if length.is_some() {
-                                return Err("duplicate API content length".into());
-                            }
-                            length = Some(value.trim().parse::<usize>()?);
-                        }
+                        length = Some(value.trim().parse::<usize>()?);
                     }
                 }
-                let length = if status == 204 {
-                    0
-                } else {
-                    length.ok_or("missing API content length")?
-                };
-                if length > MAX_RESPONSE {
-                    return Err("API body is too large".into());
-                }
-                framing = Some((index + 4, length, status));
             }
+            let length = if status == 204 {
+                0
+            } else {
+                length.ok_or("missing API content length")?
+            };
+            if length > MAX_RESPONSE {
+                return Err("API body is too large".into());
+            }
+            framing = Some((index + 4, length, status));
         }
-        if let Some((start, length, status)) = framing {
-            if bytes.len() >= start + length {
-                let body = bytes[start..start + length].to_vec();
-                if !(200..300).contains(&status) {
-                    return Err(format!(
-                        "Cloud Hypervisor HTTP {status}: {}",
-                        String::from_utf8_lossy(&body)
-                    )
-                    .into());
-                }
-                return Ok(body);
+        if let Some((start, length, status)) = framing
+            && bytes.len() >= start + length
+        {
+            let body = bytes[start..start + length].to_vec();
+            if !(200..300).contains(&status) {
+                return Err(format!(
+                    "Cloud Hypervisor HTTP {status}: {}",
+                    String::from_utf8_lossy(&body)
+                )
+                .into());
             }
+            return Ok(body);
         }
     }
 }

@@ -48,16 +48,6 @@ pub(crate) struct Scope {
     pub selector: String,
 }
 
-fn valid_profile(id: &str) -> bool {
-    id.len() == 36
-        && id.bytes().enumerate().all(|(i, b)| {
-            if [8, 13, 18, 23].contains(&i) {
-                b == b'-'
-            } else {
-                b.is_ascii_hexdigit()
-            }
-        })
-}
 fn valid_scope_path(path: &str) -> bool {
     path.len() <= 2049
         && (crate::proxy::valid_path(path)
@@ -67,7 +57,7 @@ fn valid_scope_path(path: &str) -> bool {
 
 impl GuestBearer {
     fn valid(&self) -> bool {
-        valid_profile(&self.agent_profile_id)
+        crate::sandbox::valid_uuid(&self.agent_profile_id)
             && crate::proxy::valid_host(&self.host)
             && self.host == self.host.to_ascii_lowercase()
             && !self.methods.is_empty()
@@ -90,7 +80,7 @@ impl GuestBearer {
 
 impl Scope {
     fn valid(&self) -> bool {
-        valid_profile(&self.agent_profile_id)
+        crate::sandbox::valid_uuid(&self.agent_profile_id)
             && crate::proxy::valid_host(&self.host)
             && self.host == self.host.to_ascii_lowercase()
             && !self.paths.is_empty()
@@ -334,12 +324,13 @@ impl Credentials {
 
     pub fn identities(&self, headers: &[(String, String)]) -> serde_json::Value {
         serde_json::Value::Array(headers.iter().filter_map(|(name, value)| {
-            if name == "authorization" && !self.guest_bearer.is_empty() {
-                if let Some(token) = self.guest_token(value) {
-                    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
-                    let hash = digest.as_ref().iter().map(|b| format!("{b:02X}")).collect::<String>();
-                    return Some(serde_json::json!({"placeholder":format!("{GUEST_ID_PREFIX}{hash}"), "header":name}));
-                }
+            if name == "authorization"
+                && !self.guest_bearer.is_empty()
+                && let Some(token) = self.guest_token(value)
+            {
+                let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+                let hash = digest.as_ref().iter().map(|b| format!("{b:02X}")).collect::<String>();
+                return Some(serde_json::json!({"placeholder":format!("{GUEST_ID_PREFIX}{hash}"), "header":name}));
             }
             None
         }).collect())
@@ -402,5 +393,38 @@ impl Credentials {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Credentials;
+    use crate::injection::Placement;
+
+    #[test]
+    fn host_credentials_require_tls_even_with_a_matching_scope() {
+        let profile = "12345678-1234-1234-1234-123456789abc";
+        let config = serde_json::json!({
+            "credentials": [{
+                "placeholder": "API_KEY",
+                "secret": "a-secret-with-16-chars",
+                "scopes": [{
+                    "agentProfileId": profile,
+                    "host": "example.com",
+                    "paths": ["/v1/*"],
+                    "location": "header",
+                    "selector": "x-api-key"
+                }]
+            }]
+        });
+        let credentials = Credentials::parse(&config.to_string()).unwrap();
+        let plan = [Placement {
+            placeholder: "API_KEY".into(),
+            location: "header".into(),
+            selector: "x-api-key".into(),
+        }];
+
+        assert!(!credentials.permits(&plan, profile, "example.com", "GET", "/v1/items", false));
+        assert!(credentials.permits(&plan, profile, "example.com", "GET", "/v1/items", true));
     }
 }

@@ -27,6 +27,17 @@ pub struct PacketGate {
     failed: Arc<AtomicBool>,
     worker: Option<JoinHandle<std::result::Result<(), String>>>,
 }
+pub(crate) struct PacketGateConfig<'a> {
+    pub network: &'a VmNetwork,
+    pub capture_tap: &'a str,
+    pub inspection_tap: &'a str,
+    pub guest: File,
+    pub backend: Backend,
+    pub profile: String,
+    pub run: String,
+    pub cancelled: Arc<AtomicBool>,
+    pub deadline: Instant,
+}
 pub(crate) fn open_tap(name: &str) -> Result<File> {
     if name.len() >= libc::IFNAMSIZ || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     {
@@ -96,12 +107,13 @@ fn flush(
     if counts.is_empty() {
         return Ok(());
     }
-    let events = std::mem::take(counts)
-        .into_iter()
+    let events = counts
+        .iter()
         .map(|((decision, meta), (packets, bytes))| {
-            audit_event(profile, run, decision, &meta, packets, bytes)
+            audit_event(profile, run, *decision, meta, *packets, *bytes)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
+    counts.clear();
     if let Err(error) = sender.try_send(events) {
         let events = match error {
             mpsc::TrySendError::Full(v) | mpsc::TrySendError::Disconnected(v) => v,
@@ -113,18 +125,85 @@ fn flush(
     }
     Ok(())
 }
+
+fn dropped_packets(path: &str) -> Result<u64> {
+    Ok(std::fs::read_to_string(path)?.trim().parse()?)
+}
+
+fn capture_frames(
+    capture: &mut File,
+    inspection: &mut File,
+    policy: &NetworkPolicy,
+    counts: &mut Counts,
+    received: &AtomicU64,
+) -> Result<()> {
+    let mut bytes = [0u8; 65536];
+    for _ in 0..64 {
+        let count = match capture.read(&mut bytes) {
+            Ok(0) => return Err("network policy interface closed".into()),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error.into()),
+        };
+        received.fetch_add(1, Ordering::Relaxed);
+        let frame = &bytes[..count];
+        let (decision, metadata) = policy.evaluate(frame);
+        let entry = counts.entry((decision, metadata)).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += count as u64;
+        if decision.passes() {
+            send_frame(inspection, frame)?;
+        }
+    }
+    Ok(())
+}
+
+fn relay_frames(inspection: &mut File, guest: &mut File) -> Result<()> {
+    let mut bytes = [0u8; 65536];
+    for _ in 0..64 {
+        match inspection.read(&mut bytes) {
+            Ok(0) => return Err("inspection interface closed".into()),
+            Ok(count) => send_frame(guest, &bytes[..count])?,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn check_capture_loss(
+    paths: &[String; 2],
+    baseline: &[u64; 2],
+    run: &str,
+    received: &AtomicU64,
+) -> Result<()> {
+    for (path, old) in paths.iter().zip(baseline) {
+        let dropped = dropped_packets(path)?;
+        if dropped > *old {
+            eprintln!(
+                "network-policy run={run} capture_loss={} observed_packets={}",
+                dropped - old,
+                received.load(Ordering::Relaxed)
+            );
+            return Err("kernel packet capture lost frames; stopping VM".into());
+        }
+    }
+    Ok(())
+}
+
 impl PacketGate {
-    pub fn start(
-        network: &VmNetwork,
-        capture_tap: &str,
-        inspection_tap: &str,
-        mut guest: File,
-        backend: Backend,
-        profile: String,
-        run: String,
-        cancelled: Arc<AtomicBool>,
-        deadline: Instant,
-    ) -> Result<Self> {
+    pub(crate) fn start(config: PacketGateConfig<'_>) -> Result<Self> {
+        let PacketGateConfig {
+            network,
+            capture_tap,
+            inspection_tap,
+            mut guest,
+            backend,
+            profile,
+            run,
+            cancelled,
+            deadline,
+        } = config;
         let policy = NetworkPolicy::new(network)?;
         let mut capture = open_tap(capture_tap)?;
         let mut inspection = open_tap(inspection_tap)?;
@@ -138,63 +217,96 @@ impl PacketGate {
             format!("/sys/class/net/{capture_tap}/statistics/tx_dropped"),
             format!("/sys/class/net/{}/statistics/rx_dropped", network.tap),
         ];
-        let worker = thread::Builder::new().name("vm-network-policy".into()).spawn(move || {
-            let (sender, receiver) = mpsc::sync_channel::<Vec<Value>>(16);
-            let logger = thread::Builder::new().name("vm-network-audit".into()).spawn(move || {
-                for events in receiver {
-                    for event in &events { eprintln!("network-policy {event}"); }
-                    backend.report_network_history(&events);
+        let worker = thread::Builder::new()
+            .name("vm-network-policy".into())
+            .spawn(move || {
+                let (sender, receiver) = mpsc::sync_channel::<Vec<Value>>(16);
+                let logger = thread::Builder::new()
+                    .name("vm-network-audit".into())
+                    .spawn(move || {
+                        for events in receiver {
+                            for event in &events {
+                                eprintln!("network-policy {event}");
+                            }
+                            backend.report_network_history(&events);
+                        }
+                    })
+                    .map_err(|error| error.to_string())?;
+                let mut counts = Counts::new();
+                let result = (|| -> Result<()> {
+                    let baseline = [
+                        dropped_packets(&dropped_paths[0])?,
+                        dropped_packets(&dropped_paths[1])?,
+                    ];
+                    let mut last_flush = Instant::now();
+                    while !stopping.load(Ordering::Relaxed)
+                        && !cancelled.load(Ordering::Relaxed)
+                        && Instant::now() < deadline
+                    {
+                        let mut polls = [
+                            libc::pollfd {
+                                fd: capture.as_raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                            libc::pollfd {
+                                fd: inspection.as_raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                        ];
+                        if unsafe {
+                            libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 50)
+                        } < 0
+                        {
+                            let error = std::io::Error::last_os_error();
+                            if error.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            return Err(error.into());
+                        }
+                        if polls.iter().any(|poll| {
+                            poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+                        }) {
+                            return Err("network policy interface lost".into());
+                        }
+                        if polls[0].revents & libc::POLLIN != 0 {
+                            capture_frames(
+                                &mut capture,
+                                &mut inspection,
+                                &policy,
+                                &mut counts,
+                                &counter,
+                            )?;
+                            if counts.len() >= 128 {
+                                flush(&mut counts, &sender, &profile, &run)?;
+                                last_flush = Instant::now();
+                            }
+                        }
+                        if polls[1].revents & libc::POLLIN != 0 {
+                            relay_frames(&mut inspection, &mut guest)?;
+                        }
+                        if last_flush.elapsed() >= Duration::from_secs(1) {
+                            check_capture_loss(&dropped_paths, &baseline, &run, &counter)?;
+                            flush(&mut counts, &sender, &profile, &run)?;
+                            last_flush = Instant::now();
+                        }
+                    }
+                    Ok(())
+                })();
+                let flushed = flush(&mut counts, &sender, &profile, &run);
+                drop(sender);
+                let logged = logger
+                    .join()
+                    .map_err(|_| "network audit worker panicked".to_string());
+                if result.is_err() || flushed.is_err() || logged.is_err() {
+                    failure.store(true, Ordering::Relaxed);
                 }
-            }).map_err(|e|e.to_string())?;
-            let mut counts = Counts::new(); let mut last_flush = Instant::now();
-            let baseline = dropped_paths.iter().map(|path| std::fs::read_to_string(path).map_err(|e|e.to_string()).and_then(|s|s.trim().parse::<u64>().map_err(|e|e.to_string()))).collect::<std::result::Result<Vec<_>, _>>()?;
-            let mut bytes = [0u8; 65536];
-            let result = (|| -> Result<()> {
-                while !stopping.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) && Instant::now() < deadline {
-                    let mut polls = [libc::pollfd {fd:capture.as_raw_fd(),events:libc::POLLIN,revents:0},
-                        libc::pollfd {fd:inspection.as_raw_fd(),events:libc::POLLIN,revents:0}];
-                    if unsafe { libc::poll(polls.as_mut_ptr(),2,50) } < 0 {
-                        let error=std::io::Error::last_os_error(); if error.kind()==std::io::ErrorKind::Interrupted {continue;} return Err(error.into());
-                    }
-                    if polls.iter().any(|p| p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0) {return Err("network policy interface lost".into());}
-                    if polls[0].revents & libc::POLLIN != 0 {
-                        for _ in 0..64 {
-                            let count = match capture.read(&mut bytes) {
-                                Ok(0) => return Err("network policy interface closed".into()), Ok(n)=>n,
-                                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>break, Err(e)=>return Err(e.into()) };
-                            counter.fetch_add(1,Ordering::Relaxed);
-                            let frame=&bytes[..count]; let (decision,meta)=policy.evaluate(frame);
-                            let entry=counts.entry((decision,meta)).or_insert((0,0)); entry.0+=1;entry.1+=count as u64;
-                            if decision.passes() {send_frame(&mut inspection,frame)?;}
-                            if counts.len()>=128 {flush(&mut counts,&sender,&profile,&run)?;last_flush=Instant::now();}
-                        }
-                    }
-                    if polls[1].revents & libc::POLLIN != 0 {
-                        for _ in 0..64 {
-                            match inspection.read(&mut bytes) { Ok(0)=>return Err("inspection interface closed".into()),
-                                Ok(n)=>send_frame(&mut guest,&bytes[..n])?,
-                                Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>break,Err(e)=>return Err(e.into()) }
-                        }
-                    }
-                    if last_flush.elapsed()>=Duration::from_secs(1) {
-                        for (path, old) in dropped_paths.iter().zip(&baseline) {
-                            let dropped=std::fs::read_to_string(path)?.trim().parse::<u64>()?;
-                            if dropped > *old { eprintln!("network-policy run={run} capture_loss={} observed_packets={}", dropped-old,counter.load(Ordering::Relaxed));
-                                return Err("kernel packet capture lost frames; stopping VM".into()); }
-                        }
-                        flush(&mut counts,&sender,&profile,&run)?;last_flush=Instant::now();
-                    }
-                }
-                Ok(())
-            })();
-            if result.is_err() {failure.store(true,Ordering::Relaxed);}
-            let flushed=flush(&mut counts,&sender,&profile,&run);
-            if flushed.is_err() {failure.store(true,Ordering::Relaxed); }
-            drop(sender);
-            let logged=logger.join().map_err(|_|"network audit worker panicked".to_string());
-            if logged.is_err() {failure.store(true,Ordering::Relaxed); }
-            result.and(flushed).map_err(|e|e.to_string()).and(logged)
-        })?;
+                result
+                    .and(flushed)
+                    .map_err(|error| error.to_string())
+                    .and(logged)
+            })?;
         Ok(Self {
             stop,
             received,
@@ -227,13 +339,12 @@ impl PacketGate {
 impl Drop for PacketGate {
     fn drop(&mut self) {
         self.stop();
-        if let Some(worker) = self.worker.take() {
-            if let Err(error) = worker
+        if let Some(worker) = self.worker.take()
+            && let Err(error) = worker
                 .join()
                 .unwrap_or_else(|_| Err("network policy worker panicked".into()))
-            {
-                eprintln!("network-policy failure={error}");
-            }
+        {
+            eprintln!("network-policy failure={error}");
         }
     }
 }

@@ -6,10 +6,14 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, fmt};
 pub const MAX_BODY: usize = 8 * 1024 * 1024;
 pub fn is_json(content_type: &str) -> bool {
-    matches!(
-        content_type.split(';').next(),
-        Some("application/json" | "application/merge-patch+json" | "application/json-patch+json")
-    )
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    [
+        "application/json",
+        "application/merge-patch+json",
+        "application/json-patch+json",
+    ]
+    .iter()
+    .any(|supported| media_type.eq_ignore_ascii_case(supported))
 }
 pub fn opaque_metadata(
     bytes: &[u8],
@@ -85,5 +89,30 @@ impl<'de> Visitor<'de> for Json {
             map.next_value_seed(Json(self.0 + 1))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_json, validate_json_for_injection};
+
+    #[test]
+    fn json_media_type_ignores_case_and_parameters() {
+        assert!(is_json("Application/JSON; charset=utf-8"));
+        assert!(is_json(" application/merge-patch+json "));
+        assert!(!is_json("text/plain"));
+    }
+
+    #[test]
+    fn credential_json_rejects_duplicate_keys_and_trailing_data() {
+        assert!(validate_json_for_injection(br#"{"token":"a","token":"b"}"#).is_err());
+        assert!(validate_json_for_injection(br#"{"token":"a"} true"#).is_err());
+        assert!(validate_json_for_injection(br#"{"token":"a"}"#).is_ok());
+    }
+
+    #[test]
+    fn credential_json_enforces_nesting_limit() {
+        let nested = format!("{}0{}", "[".repeat(34), "]".repeat(34));
+        assert!(validate_json_for_injection(nested.as_bytes()).is_err());
     }
 }

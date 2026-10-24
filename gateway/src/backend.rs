@@ -2,7 +2,7 @@ mod expiration;
 
 use crate::{
     request_lifecycle::{EndReason, RequestLifecycle, RequestMonitor},
-    sandbox::Result,
+    sandbox::{Result, valid_uuid},
 };
 use chrono::{DateTime, Utc};
 use expiration::ExpirationReporter;
@@ -146,7 +146,7 @@ impl Backend {
     }
 
     pub fn validate_profile(&self, profile: &str) -> Result<()> {
-        if !uuid(profile) {
+        if !valid_uuid(profile) {
             return Err("an Agent Profile UUID is required".into());
         }
         let result = self.request(&format!("/gateway/agent-profiles/{profile}"), None, &|| {
@@ -236,7 +236,7 @@ impl Backend {
         )?;
         let id = session["id"]
             .as_str()
-            .filter(|id| uuid(id))
+            .filter(|id| valid_uuid(id))
             .ok_or("invalid setup session")?;
         if session["agentProfileId"] != profile
             || Utc::now() >= setup_expiry(&session["expiresAt"])?
@@ -363,7 +363,7 @@ impl Backend {
             Some("REQUIRE_APPROVAL") => {
                 let id = result["approvalRequestId"]
                     .as_str()
-                    .filter(|s| uuid(s))
+                    .filter(|s| valid_uuid(s))
                     .ok_or("invalid approval ID")?;
                 self.wait_for_approval(profile, action, id, lifecycle, monitor)
             }
@@ -390,14 +390,4 @@ fn setup_expiry(value: &Value) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value.as_str().ok_or("missing setup session expiry")?)
         .map(|v| v.with_timezone(&Utc))
         .map_err(|_| "invalid setup session expiry".into())
-}
-fn uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(i, b)| {
-            if [8, 13, 18, 23].contains(&i) {
-                b == b'-'
-            } else {
-                b.is_ascii_hexdigit()
-            }
-        })
 }

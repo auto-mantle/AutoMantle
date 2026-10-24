@@ -1,6 +1,6 @@
 use crate::{
     backend::Backend,
-    packet_gate::PacketGate,
+    packet_gate::{PacketGate, PacketGateConfig},
     privileged,
     sandbox::{Result, VmNetwork},
 };
@@ -23,20 +23,33 @@ pub(super) struct NetworkLease {
 
 impl NetworkLease {
     pub(super) fn create(id: &str) -> Result<Self> {
+        let suffix = crate::linux::run_suffix(id)?;
         let (value, guest_sender) =
             privileged::request(json!({"command":"create-network","id":id}))?;
-        let config: VmNetwork = serde_json::from_value(value)?;
-        let guest_sender = guest_sender.ok_or("helper did not return guest network handle")?;
-        let suffix = id.strip_prefix("automantle-vm-").ok_or("invalid run ID")?;
-        Ok(Self {
-            config,
-            id: id.into(),
-            capture_tap: format!("amc{}", &suffix[..10]),
-            inspection_tap: format!("ami{}", &suffix[..10]),
-            guest_sender: Some(guest_sender),
-            gate: None,
-            active: true,
-        })
+        let result = (|| -> Result<Self> {
+            let config: VmNetwork = serde_json::from_value(value)?;
+            let guest_sender = guest_sender.ok_or("helper did not return guest network handle")?;
+            Ok(Self {
+                config,
+                id: id.into(),
+                capture_tap: format!("amc{}", &suffix[..10]),
+                inspection_tap: format!("ami{}", &suffix[..10]),
+                guest_sender: Some(guest_sender),
+                gate: None,
+                active: true,
+            })
+        })();
+        match result {
+            Ok(lease) => Ok(lease),
+            Err(error) => {
+                if let Err(cleanup) =
+                    privileged::request(json!({"command":"remove-network","id":id}))
+                {
+                    return Err(format!("network setup failed: {error}; cleanup: {cleanup}").into());
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(super) fn start_policy(
@@ -51,17 +64,17 @@ impl NetworkLease {
             .guest_sender
             .take()
             .ok_or("guest network handle was consumed")?;
-        self.gate = Some(PacketGate::start(
-            &self.config,
-            &self.capture_tap,
-            &self.inspection_tap,
+        self.gate = Some(PacketGate::start(PacketGateConfig {
+            network: &self.config,
+            capture_tap: &self.capture_tap,
+            inspection_tap: &self.inspection_tap,
             guest,
             backend,
             profile,
             run,
             cancelled,
             deadline,
-        )?);
+        })?);
         Ok(())
     }
 

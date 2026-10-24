@@ -1,4 +1,4 @@
-use super::destination::{http_origin, parse_target};
+use super::destination::parse_target;
 use super::{Credentials, Result, body};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -92,13 +92,22 @@ impl Request {
         }
         action
     }
-    pub(super) fn reviewed_action(&self, credentials: &Credentials) -> serde_json::Value {
+    pub(super) fn reviewed_action(
+        &self,
+        credentials: &Credentials,
+        plan: Option<&[crate::injection::Placement]>,
+    ) -> serde_json::Value {
         let mut action = self.action();
-        let mut identities = self
-            .credential_plan(credentials)
-            .unwrap_or_default()
+        let mut identities = plan
+            .unwrap_or(&[])
             .iter()
-            .map(|placement| serde_json::to_value(placement).unwrap())
+            .map(|placement| {
+                serde_json::json!({
+                    "placeholder": placement.placeholder,
+                    "location": placement.location,
+                    "selector": placement.selector,
+                })
+            })
             .collect::<Vec<_>>();
         if let Some(guest) = credentials.identities(&self.headers).as_array() {
             identities.extend(
@@ -153,7 +162,10 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
     }
     let method = first[0];
     let target = first[1];
-    let (host, path, port) = if method == "CONNECT" {
+    if method.len() > 64 || !valid_method(method) {
+        return Err((400, "invalid HTTP method"));
+    }
+    let (host, path, port, forward_target) = if method == "CONNECT" {
         if tunnel_host.is_some() {
             return Err((403, "nested CONNECT denied"));
         }
@@ -161,11 +173,12 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
             connect_host(target).ok_or((400, "CONNECT requires a DNS name on port 443"))?,
             String::new(),
             443,
+            String::new(),
         )
     } else {
         match tunnel_host {
             Some(host) => {
-                if !target.starts_with('/') && !(method == "OPTIONS" && target == "*") {
+                if !(target.starts_with('/') || method == "OPTIONS" && target == "*") {
                     return Err((400, "invalid HTTPS request path"));
                 }
                 (
@@ -173,18 +186,22 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
                     if target == "*" {
                         "/".into()
                     } else {
-                        target.split('?').next().unwrap().to_owned()
+                        target.split('?').next().unwrap_or(target).to_owned()
                     },
                     443,
+                    target.to_owned(),
                 )
             }
             None => {
-                let (host, path) = parse_target(target)
+                let (host, path, origin) = parse_target(target)
                     .ok_or((400, "only absolute plain HTTP URLs are supported"))?;
-                (host, path, 80)
+                (host, path, 80, origin)
             }
         }
     };
+    if !valid_host(&host) || (method != "CONNECT" && !valid_path(&path)) {
+        return Err((400, "invalid destination or request path"));
+    }
     let mut headers = Vec::new();
     let mut seen = BTreeSet::new();
     for line in lines {
@@ -260,11 +277,7 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
     };
     let media = headers.iter().find(|(name, _)| name == "content-type");
     let content_type = if writes_body(method) {
-        match media {
-            Some((_, value)) => value.clone(),
-            None if content_length == 0 => String::new(),
-            None => String::new(),
-        }
+        media.map(|(_, value)| value.clone()).unwrap_or_default()
     } else {
         if content_length != 0 || media.is_some() || (method == "CONNECT" && length.is_some()) {
             return Err((400, "body is not supported for this method"));
@@ -275,13 +288,7 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
         method: method.to_owned(),
         host,
         path,
-        target: if tunnel_host.is_some() {
-            target.to_owned()
-        } else if method == "CONNECT" {
-            String::new()
-        } else {
-            http_origin(target).unwrap().1
-        },
+        target: forward_target,
         headers,
         content_length,
         chunked,
@@ -365,4 +372,45 @@ fn forwardable_query(target: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_request;
+
+    #[test]
+    fn absolute_http_query_keeps_its_forwarding_target() {
+        let request = parse_request(
+            b"GET http://example.com?item=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.host, "example.com");
+        assert_eq!(request.path, "/");
+        assert_eq!(request.target, "/?item=1");
+    }
+
+    #[test]
+    fn tunnel_request_preserves_origin_and_policy_path() {
+        let request = parse_request(
+            b"GET /v1/items?item=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            Some("example.com"),
+        )
+        .unwrap();
+
+        assert_eq!(request.path, "/v1/items");
+        assert_eq!(request.target, "/v1/items?item=1");
+    }
+
+    #[test]
+    fn request_rejects_noncanonical_paths_and_method_tokens() {
+        for raw in [
+            &b"GET /allowed/../admin HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"GET /allowed/%2Fadmin HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+            &b"GE\tT /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n"[..],
+        ] {
+            assert!(parse_request(raw, Some("example.com")).is_err());
+        }
+    }
 }
