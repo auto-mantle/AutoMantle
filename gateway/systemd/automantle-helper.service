@@ -1,0 +1,11 @@
+[Unit]
+Description=AutoMantle privileged host helper
+Requires=automantle-helper.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/automantle-helper
+NoNewPrivileges=yes
+UMask=0077

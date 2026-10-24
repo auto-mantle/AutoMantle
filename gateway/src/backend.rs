@@ -82,10 +82,13 @@ impl Backend {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
         let meta = file.metadata()?;
-        if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o077 != 0 || meta.len() > 16 * 1024
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o077 != 0
+            || meta.len() > 16 * 1024
         {
             return Err(
-                "gateway config must be a root-owned regular file, mode 0600, at most 16 KiB"
+                "gateway config must be a private gateway-owned regular file, mode 0600, at most 16 KiB"
                     .into(),
             );
         }

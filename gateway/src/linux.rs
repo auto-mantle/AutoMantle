@@ -1,14 +1,14 @@
 use crate::{
     backend::Backend,
-    hypervisor_api,
+    hypervisor_api, privileged,
     proxy::Proxy,
     sandbox::{Result, RunRequest},
 };
+use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::{
-        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         net::UnixStream,
     },
@@ -23,12 +23,13 @@ use std::{
 };
 
 mod console;
-mod host_command;
-mod network;
-mod preflight;
+pub(crate) mod host_command;
+pub(crate) mod network;
+mod network_client;
+pub(crate) mod preflight;
 use console::ConsolePump;
 use host_command::{checked, command};
-use network::HostNetwork;
+use network_client::NetworkLease;
 pub use preflight::doctor;
 
 const RUN_PREFIX: &str = "automantle-vm-";
@@ -56,13 +57,13 @@ const MAX_CONSOLE: u64 = 16 * 1024 * 1024;
 
 struct Run {
     id: String,
-    service_user: String,
     directory: PathBuf,
+    destroyed: bool,
     service_started: bool,
     console: Option<ConsolePump>,
-    network: Option<HostNetwork>,
+    network: Option<NetworkLease>,
     proxy: Option<Proxy>,
-    persistent_root: Option<PathBuf>,
+    persistent_root: Option<File>,
     runtime_root: Option<PathBuf>,
 }
 
@@ -72,34 +73,11 @@ impl Run {
             return Err("invalid run ID".into());
         }
         let directory = Path::new("/run").join(&id);
-        let suffix = id
-            .strip_prefix(RUN_PREFIX)
-            .ok_or("invalid generated run ID")?;
-        let service_user = format!("amv{}", &suffix[..10]);
-        checked(Command::new("/usr/sbin/useradd").args([
-            "--system",
-            "--no-create-home",
-            "--home-dir",
-            "/nonexistent",
-            "--shell",
-            "/usr/sbin/nologin",
-            "--groups",
-            "kvm",
-            &service_user,
-        ]))?;
-        if let Err(error) = fs::create_dir(&directory) {
-            let _ = command(Command::new("/usr/sbin/userdel").arg(&service_user));
-            return Err(error.into());
-        }
-        if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
-            let _ = fs::remove_dir(&directory);
-            let _ = command(Command::new("/usr/sbin/userdel").arg(&service_user));
-            return Err(error.into());
-        }
+        privileged::request(json!({"command":"create-run","id":id}))?;
         Ok(Self {
             id,
-            service_user,
             directory,
+            destroyed: false,
             service_started: false,
             console: None,
             network: None,
@@ -153,13 +131,7 @@ impl Run {
                 .write(true)
                 .mode(0o600)
                 .open(self.directory.join("rootfs"))?;
-            self.persistent_root = Some(source.clone());
-            checked(
-                Command::new("/usr/bin/mount")
-                    .arg("--bind")
-                    .arg(&source)
-                    .arg(self.directory.join("rootfs")),
-            )?;
+            self.persistent_root = Some(OpenOptions::new().read(true).open(source)?);
         } else {
             copy_image(
                 &request.rootfs,
@@ -189,117 +161,35 @@ impl Run {
             self.directory.join("vm.json"),
             serde_json::to_vec_pretty(&request.vm_config(
                 &self.directory,
-                self.network.as_ref().map(HostNetwork::config),
+                self.network.as_ref().map(NetworkLease::config),
             ))?,
         )?;
-        let uid = checked(Command::new("/usr/bin/id").args(["-u", &self.service_user]))?;
-        let gid = checked(Command::new("/usr/bin/id").args(["-g", &self.service_user]))?;
-        let uid = String::from_utf8(uid.stdout)?.trim().parse::<u32>()?;
-        let gid = String::from_utf8(gid.stdout)?.trim().parse::<u32>()?;
-        for path in [
-            self.directory.clone(),
-            self.directory.join("kernel"),
-            self.directory.join("rootfs"),
-            self.directory.join("scratch"),
-            self.directory.join("vm.json"),
-        ] {
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-            if unsafe { libc::chown(path.as_ptr(), uid, gid) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        if request.initramfs.is_some() {
-            let path =
-                std::ffi::CString::new(self.directory.join("initramfs").as_os_str().as_bytes())?;
-            if unsafe { libc::chown(path.as_ptr(), uid, gid) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
+        privileged::request_with_file(
+            json!({
+                "command":"prepare-run", "id":self.id,
+                "saved":self.persistent_root.is_some(),
+                "initramfs":request.initramfs.is_some(),
+            }),
+            self.persistent_root.as_ref(),
+        )?;
         Ok(())
     }
 
     fn start(&mut self, request: &RunRequest, lifetime: Duration) -> Result<()> {
-        let mut cmd = Command::new("/usr/bin/systemd-run");
-        cmd.args(["--quiet", "--service-type=exec", "--unit", &self.id]);
-        let with_network = self.network.is_some();
-        for property in [
-            format!("User={}", self.service_user),
-            "DynamicUser=no".into(),
-            "SupplementaryGroups=kvm".into(),
-            format!("RuntimeDirectory={}", self.id),
-            "RuntimeDirectoryMode=0700".into(),
-            "RuntimeDirectoryPreserve=yes".into(),
-            "UMask=0077".into(),
-            "RemainAfterExit=yes".into(),
-            format!("PrivateNetwork={}", if with_network { "no" } else { "yes" }),
-            format!(
-                "RestrictAddressFamilies={}",
-                if with_network {
-                    "AF_UNIX AF_INET"
-                } else {
-                    "AF_UNIX"
-                }
-            ),
-            "ProtectSystem=strict".into(),
-            "ProtectHome=yes".into(),
-            "NoNewPrivileges=yes".into(),
-            "CapabilityBoundingSet=".into(),
-            "ProtectKernelTunables=yes".into(),
-            "ProtectKernelModules=yes".into(),
-            "ProtectControlGroups=yes".into(),
-            "RestrictSUIDSGID=yes".into(),
-            "ProtectProc=invisible".into(),
-            "DevicePolicy=closed".into(),
-            "DeviceAllow=/dev/kvm rw".into(),
-            "LimitCORE=0".into(),
-            format!(
-                "LimitFSIZE={}",
-                fs::metadata(self.directory.join("rootfs"))?
-                    .len()
-                    .max(1024 * 1024 * 1024)
-            ),
-            "KillMode=control-group".into(),
-            "TimeoutStopSec=3s".into(),
-            if request.timeout.is_zero() {
-                "RuntimeMaxSec=infinity".into()
-            } else {
-                format!("RuntimeMaxSec={}s", lifetime.as_secs().max(1))
-            },
-            format!("MemoryMax={}M", request.memory_mib + 256),
-            "MemorySwapMax=0".into(),
-            format!("CPUQuota={}%", request.vcpus * 100),
-            format!("TasksMax={}", request.vcpus * 2 + 64),
-            format!(
-                "ReadOnlyPaths={}/kernel {}/vm.json{}",
-                self.directory.display(),
-                self.directory.display(),
-                if request.saved_disk.is_none() {
-                    format!(" {}/rootfs", self.directory.display())
-                } else {
-                    String::new()
-                }
-            ),
-            "StandardOutput=null".into(),
-            "StandardError=journal".into(),
-        ] {
-            cmd.arg("--property").arg(property);
-        }
-        if with_network {
-            cmd.arg("--property").arg("DeviceAllow=/dev/net/tun rw");
-        }
-        if request.initramfs.is_some() {
-            cmd.arg("--property").arg(format!(
-                "ReadOnlyPaths={}/initramfs",
-                self.directory.display()
-            ));
-        }
-        cmd.arg("--")
-            .arg(fs::canonicalize(&request.hypervisor)?)
-            .arg("--api-socket")
-            .arg(self.socket())
-            .args(["--seccomp", "true"]);
         self.service_started = true;
-        checked(&mut cmd)?;
+        privileged::request(json!({
+            "command":"start-vmm", "id":self.id,
+            "settings":{
+                "memoryMib":request.memory_mib,
+                "vcpus":request.vcpus,
+                "lifetimeSeconds":if request.timeout.is_zero() {0} else {lifetime.as_secs().max(1)},
+                "network":self.network.is_some(),
+                "saved":request.saved_disk.is_some(),
+                "preparation":request.preparation,
+                "initramfs":request.initramfs.is_some(),
+                "hypervisor":request.hypervisor,
+            }
+        }))?;
         Ok(())
     }
 
@@ -324,20 +214,13 @@ impl Run {
     }
 
     fn release_persistent_root(&mut self) -> Result<()> {
-        let Some(source) = &self.persistent_root else {
+        let Some(source) = self.persistent_root.as_ref() else {
             return Ok(());
         };
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(source)?
-            .sync_all()?;
-        let path = std::ffi::CString::new(source.as_os_str().as_bytes())?;
-        if unsafe { libc::chown(path.as_ptr(), 0, 0) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        fs::set_permissions(source, fs::Permissions::from_mode(0o600))?;
-        checked(Command::new("/usr/bin/umount").arg(self.directory.join("rootfs")))?;
+        privileged::request_with_file(
+            json!({"command":"release-saved","id":self.id}),
+            Some(source),
+        )?;
         self.persistent_root = None;
         Ok(())
     }
@@ -356,6 +239,9 @@ impl Run {
     }
 
     fn cleanup(&mut self) -> Result<()> {
+        if self.destroyed {
+            return Ok(());
+        }
         if let Some(proxy) = self.proxy.as_ref() {
             proxy.stop();
         }
@@ -363,15 +249,8 @@ impl Run {
             gate.stop();
         }
         if self.service_started {
-            let stop = command(Command::new("/usr/bin/systemctl").args(["stop", &self.id]))?;
-            if !stop.status.success() {
-                let state = self.state()?;
-                if !matches!(state.as_str(), "dead" | "failed" | "") {
-                    return Err(format!("could not stop {}; preserving its files", self.id).into());
-                }
-            }
+            privileged::request(json!({"command":"stop-vmm","id":self.id}))?;
             self.service_started = false;
-            let _ = command(Command::new("/usr/bin/systemctl").args(["reset-failed", &self.id]));
         }
         let mut errors = Vec::new();
         if let Err(error) = self.console.take().map_or(Ok(()), ConsolePump::finish) {
@@ -393,21 +272,8 @@ impl Run {
             }
         }
         if self.persistent_root.is_none() && self.runtime_root.is_none() && self.network.is_none() {
-            match remove_run_directory(&self.directory, &self.id) {
-                Ok(()) => {
-                    match command(Command::new("/usr/sbin/userdel").arg(&self.service_user)) {
-                        Ok(userdel)
-                            if userdel.status.success()
-                                || String::from_utf8_lossy(&userdel.stderr)
-                                    .contains("does not exist") => {}
-                        Ok(userdel) => errors.push(format!(
-                            "run account {}: {}",
-                            self.service_user,
-                            String::from_utf8_lossy(&userdel.stderr).trim()
-                        )),
-                        Err(error) => errors.push(format!("run account: {error}")),
-                    }
-                }
+            match privileged::request(json!({"command":"destroy-run","id":self.id})) {
+                Ok(_) => self.destroyed = true,
                 Err(error) => errors.push(format!("run directory: {error}")),
             }
         }
@@ -432,7 +298,7 @@ pub fn request_shutdown(id: &str) -> Result<()> {
         return Err("Invalid run ID".into());
     }
     hypervisor_api::request(
-        &Path::new("/run").join(id).join("api.sock"),
+        privileged::connect_vmm(id, "api")?,
         "PUT",
         "vm.power-button",
         &[],
@@ -448,10 +314,8 @@ pub fn run(
     cancelled: Arc<AtomicBool>,
     event: EventSink,
 ) -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
-        return Err(
-            "VM launch requires sudo for systemd setup; run doctor without sudo first".into(),
-        );
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("VM launch must run through the unprivileged gateway".into());
     }
     backend.validate_profile(&request.agent_profile_id)?;
     preflight::check(&request.hypervisor)?;
@@ -481,7 +345,7 @@ pub fn run(
     let mut vm = Run::create(id)?;
     let networking = request.proxy_network;
     if networking {
-        let mut network = HostNetwork::create(&vm.id, &vm.service_user)?;
+        let mut network = NetworkLease::create(&vm.id)?;
         network.start_policy(
             backend.clone(),
             request.agent_profile_id.clone(),
@@ -489,7 +353,7 @@ pub fn run(
             Arc::clone(&cancelled),
             deadline,
         )?;
-        let host_ip = network.config.host_ip.clone();
+        let host_ip = network.config().host_ip.clone();
         vm.network = Some(network);
         vm.proxy = Some(Proxy::start(
             &host_ip,
@@ -527,9 +391,11 @@ pub fn run(
         let boot_deadline = deadline.min(Instant::now() + Duration::from_secs(15));
         loop {
             check_deadline(&cancelled, boot_deadline)?;
-            if vm.socket().exists()
-                && hypervisor_api::request(&vm.socket(), "GET", "vmm.ping", &[], boot_deadline)
-                    .is_ok()
+            if privileged::connect_vmm(&vm.id, "api")
+                .and_then(|socket| {
+                    hypervisor_api::request(socket, "GET", "vmm.ping", &[], boot_deadline)
+                })
+                .is_ok()
             {
                 break;
             }
@@ -539,19 +405,25 @@ pub fn run(
             thread::sleep(Duration::from_millis(50));
         }
         hypervisor_api::request(
-            &vm.socket(),
+            privileged::connect_vmm(&vm.id, "api")?,
             "PUT",
             "vm.create",
             &serde_json::to_vec(
-                &request.vm_config(&vm.directory, vm.network.as_ref().map(HostNetwork::config)),
+                &request.vm_config(&vm.directory, vm.network.as_ref().map(NetworkLease::config)),
             )?,
             boot_deadline,
         )?;
-        let serial = UnixStream::connect(vm.directory.join("serial.sock"))?;
+        let serial = privileged::connect_vmm(&vm.id, "serial")?;
         serial.set_nonblocking(true)?;
         event(RunEvent::Terminal(serial.try_clone()?));
         vm.console = Some(ConsolePump::start(serial, Arc::clone(&event))?);
-        hypervisor_api::request(&vm.socket(), "PUT", "vm.boot", &[], boot_deadline)?;
+        hypervisor_api::request(
+            privileged::connect_vmm(&vm.id, "api")?,
+            "PUT",
+            "vm.boot",
+            &[],
+            boot_deadline,
+        )?;
         event(RunEvent::State("running"));
         eprintln!("run={} state=running api={}", vm.id, vm.socket().display());
         loop {
@@ -665,7 +537,7 @@ pub(crate) fn copy_image(
     Ok(())
 }
 
-fn remove_run_directory(directory: &Path, id: &str) -> Result<()> {
+pub(crate) fn remove_run_directory(directory: &Path, id: &str) -> Result<()> {
     let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
     if suffix.len() != 32
         || !suffix.bytes().all(|b| b.is_ascii_hexdigit())

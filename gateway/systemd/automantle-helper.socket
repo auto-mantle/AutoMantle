@@ -1,0 +1,13 @@
+[Unit]
+Description=AutoMantle privileged helper socket
+
+[Socket]
+ListenStream=/run/automantle-helper/control.sock
+SocketUser=automantle
+SocketGroup=automantle
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

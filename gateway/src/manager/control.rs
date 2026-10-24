@@ -63,10 +63,12 @@ fn bind(path: &Path, group: Option<u32>) -> Result<(UnixListener, SocketGuard)> 
     }
     for directory in parent.ancestors() {
         let m = fs::symlink_metadata(directory)?;
-        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
+        if !m.is_dir()
+            || ![0, unsafe { libc::geteuid() }].contains(&m.uid())
+            || m.mode() & 0o022 != 0
+        {
             return Err(
-                "socket directories must be real, root-owned, and not writable by other users"
-                    .into(),
+                "socket directories must be real, trusted, and not writable by other users".into(),
             );
         }
     }
@@ -86,7 +88,7 @@ fn bind(path: &Path, group: Option<u32>) -> Result<(UnixListener, SocketGuard)> 
         for target in [parent, path] {
             use std::os::unix::ffi::OsStrExt;
             let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
-            if unsafe { libc::chown(target.as_ptr(), 0, group) } != 0 {
+            if unsafe { libc::chown(target.as_ptr(), libc::geteuid(), group) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
         }
@@ -138,8 +140,8 @@ pub fn cli(args: &[String]) -> Result<()> {
         .first()
         .map(String::as_str)
         .ok_or("command is required")?;
-    if command == "start" && unsafe { libc::geteuid() } != 0 {
-        return Err("gateway management requires root on Linux".into());
+    if command == "start" && unsafe { libc::geteuid() } == 0 {
+        return Err("run the gateway as the automantle service user, not root".into());
     }
     let mut values = args[1..].to_vec();
     let mut socket = PathBuf::from(SOCKET);
@@ -151,6 +153,7 @@ pub fn cli(args: &[String]) -> Result<()> {
         values.drain(index..index + 2);
     }
     if command == "start" {
+        crate::privileged::request(json!({"command":"ping"}))?;
         let values = sandbox::options(
             &values,
             &[

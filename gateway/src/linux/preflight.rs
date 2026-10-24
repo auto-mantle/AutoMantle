@@ -10,13 +10,11 @@ use std::{
 pub fn doctor(binary: &Path) -> Result<()> {
     check(binary)?;
     println!("OK: Cloud Hypervisor v53.0, KVM API 12, systemd, cgroup v2, and Landlock.");
-    println!(
-        "VM launch needs root for systemd setup; the VMM runs as an unprivileged service user."
-    );
+    println!("The gateway runs unprivileged; its root helper sets up isolated VM services.");
     Ok(())
 }
 
-pub(super) fn check(binary: &Path) -> Result<()> {
+pub(crate) fn check(binary: &Path) -> Result<()> {
     let meta =
         fs::metadata(binary).map_err(|e| format!("Cloud Hypervisor {}: {e}", binary.display()))?;
     if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.mode() & 0o111 == 0 {

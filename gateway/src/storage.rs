@@ -37,10 +37,11 @@ impl Store {
             if !path.try_exists()? {
                 DirBuilder::new().mode(0o700).create(&path)?;
             }
-            trusted_directory(&path)?;
+            trusted_parent_directory(&path)?;
         }
-        if fs::metadata(&self.directory)?.mode() & 0o077 != 0 {
-            return Err("disk directory must have mode 0700".into());
+        let meta = fs::metadata(&self.directory)?;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            return Err("disk directory must be gateway-owned with mode 0700".into());
         }
         Ok(())
     }
@@ -151,6 +152,17 @@ pub(crate) fn trusted_directory(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
         return Err(format!("untrusted disk directory: {}", path.display()).into());
+    }
+    Ok(())
+}
+
+fn trusted_parent_directory(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir()
+        || ![0, unsafe { libc::geteuid() }].contains(&meta.uid())
+        || meta.mode() & 0o022 != 0
+    {
+        return Err(format!("untrusted disk parent: {}", path.display()).into());
     }
     Ok(())
 }

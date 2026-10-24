@@ -10,11 +10,11 @@ use std::{
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT: usize = 1024 * 1024;
 
-pub(super) fn command(command: &mut Command) -> Result<Output> {
+pub(crate) fn command(command: &mut Command) -> Result<Output> {
     run_with_timeout(command, COMMAND_TIMEOUT)
 }
 
-pub(super) fn checked(command: &mut Command) -> Result<Output> {
+pub(crate) fn checked(command: &mut Command) -> Result<Output> {
     let output = self::command(command)?;
     if !output.status.success() {
         return Err(format!(

@@ -30,3 +30,7 @@ strip = "symbols"
 [[bin]]
 name = "automantle-gateway"
 path = "src/main.rs"
+
+[[bin]]
+name = "automantle-helper"
+path = "src/bin/automantle-helper.rs"

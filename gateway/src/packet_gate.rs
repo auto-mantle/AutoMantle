@@ -47,7 +47,7 @@ pub(crate) fn open_tap(name: &str) -> Result<File> {
     }
     Ok(file)
 }
-fn guest_sender(name: &str) -> Result<File> {
+pub(crate) fn guest_sender(name: &str) -> Result<File> {
     let name = std::ffi::CString::new(name)?;
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     if index == 0 {
@@ -118,6 +118,7 @@ impl PacketGate {
         network: &VmNetwork,
         capture_tap: &str,
         inspection_tap: &str,
+        mut guest: File,
         backend: Backend,
         profile: String,
         run: String,
@@ -127,7 +128,6 @@ impl PacketGate {
         let policy = NetworkPolicy::new(network)?;
         let mut capture = open_tap(capture_tap)?;
         let mut inspection = open_tap(inspection_tap)?;
-        let mut guest = guest_sender(&network.tap)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let failed = Arc::new(AtomicBool::new(false));

@@ -65,7 +65,7 @@ impl crate::storage::Store {
         }
         result.map_err(|_| "Could not save credential store".into())
     }
-    pub fn save_credential(
+    pub(crate) fn save_credential(
         &self,
         value: SaveCredential,
         create: bool,

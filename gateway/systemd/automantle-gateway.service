@@ -1,0 +1,20 @@
+[Unit]
+Description=AutoMantle unprivileged gateway
+Requires=automantle-helper.socket
+After=automantle-helper.socket
+
+[Service]
+Type=simple
+User=automantle
+Group=automantle
+SupplementaryGroups=kvm automantle-control
+RuntimeDirectory=automantle-gateway
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/automantle-gateway start --gateway-config /etc/automantle/gateway.json --control-group automantle-control
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

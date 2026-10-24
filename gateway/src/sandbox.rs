@@ -41,20 +41,21 @@ fn print_usage() {
     println!(
         "Usage:
   automantle-gateway doctor [--cloud-hypervisor PATH]
-  sudo automantle-gateway tls init-ca --directory /var/lib/automantle/tls
-  sudo automantle-gateway start --gateway-config PATH [--cloud-hypervisor PATH]
-  sudo automantle-gateway create-disk --name NAME --rootfs PATH
-  sudo automantle-gateway list-disks
-  sudo automantle-gateway launch --kernel PATH --rootfs PATH --agent-profile-id UUID [options]
-  sudo automantle-gateway launch --kernel PATH --saved-disk NAME --agent-profile-id UUID [options]
-  sudo automantle-gateway list
-  sudo automantle-gateway logs RUN_ID
+  automantle-gateway tls init-ca --directory /var/lib/automantle/tls
+  automantle-gateway start --gateway-config PATH [--cloud-hypervisor PATH]
+  automantle-gateway create-disk --name NAME --rootfs PATH
+  automantle-gateway list-disks
+  automantle-gateway launch --kernel PATH --rootfs PATH --agent-profile-id UUID [options]
+  automantle-gateway launch --kernel PATH --saved-disk NAME --agent-profile-id UUID [options]
+  automantle-gateway list
+  automantle-gateway logs RUN_ID
   automantle-gateway terminal RUN_ID
-  sudo automantle-gateway stop-vm RUN_ID
-  sudo automantle-gateway stop
+  automantle-gateway stop-vm RUN_ID
+  automantle-gateway stop
 automantle-gateway version
 
-Start keeps one gateway running until stopped. Launch commands use that gateway.
+Start runs as the automantle service user and requires the installed root helper.
+The installer provides systemd units for both services; launch commands use the running gateway.
 Each VM has its own Cloud Hypervisor process. Network is disabled by default.
 Requires Linux, systemd, cgroup v2, Landlock, and Cloud Hypervisor v53.0.
 
@@ -332,6 +333,7 @@ pub(crate) fn valid_disk_name(name: &str) -> bool {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(target_os = "linux", derive(serde::Serialize, serde::Deserialize))]
 pub struct VmNetwork {
     pub tap: String,
     pub host_ip: String,

@@ -72,9 +72,10 @@ fn parent(path: &Path) -> Result<(File, CString)> {
         }
         directory = unsafe { File::from_raw_fd(fd) };
         let meta = directory.metadata()?;
-        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+        if ![0, unsafe { libc::geteuid() }].contains(&meta.uid()) || meta.mode() & 0o022 != 0 {
             return Err(
-                "TLS parent directories must be root-owned and not writable by others".into(),
+                "TLS parent directories must be root- or gateway-owned and not writable by others"
+                    .into(),
             );
         }
     }
@@ -95,12 +96,13 @@ pub(crate) fn protected_read(path: &Path, private: bool) -> Result<String> {
     let mut file = unsafe { File::from_raw_fd(fd) };
     let meta = file.metadata()?;
     if !meta.is_file()
-        || meta.uid() != 0
+        || meta.uid() != unsafe { libc::geteuid() }
         || meta.len() > MAX_FILE
         || meta.mode() & (if private { 0o077 } else { 0o022 }) != 0
     {
         return Err(
-            "TLS files must be bounded root-owned regular files with protected permissions".into(),
+            "TLS files must be bounded gateway-owned regular files with protected permissions"
+                .into(),
         );
     }
     let mut bytes = Vec::new();
@@ -125,9 +127,6 @@ fn upstream_config(roots: RootCertStore) -> Result<Arc<ClientConfig>> {
 }
 impl Tls {
     pub fn load(path: &Path, deadline: Instant) -> Result<Self> {
-        if unsafe { libc::geteuid() } != 0 {
-            return Err("TLS configuration requires root".into());
-        }
         let value: Value = serde_json::from_str(&protected_read(path, true)?)?;
         let fields = value.as_object().ok_or("invalid TLS configuration")?;
         if fields.len() != 2
@@ -284,9 +283,6 @@ impl Tls {
 }
 
 pub fn initialize(directory: &Path) -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
-        return Err("CA initialization requires root".into());
-    }
     let (_parent, _name) = parent(directory)?;
     let mut builder = fs::DirBuilder::new();
     use std::os::unix::fs::DirBuilderExt;

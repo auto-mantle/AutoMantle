@@ -1,29 +1,23 @@
 use super::{RUN_PREFIX, checked, command};
-use crate::{
-    backend::Backend,
-    sandbox::{Result, VmNetwork},
-};
+use crate::sandbox::{Result, VmNetwork};
 use std::{
     fs::{self, File},
     io::Read,
     path::Path,
     process::Command,
-    sync::{Arc, atomic::AtomicBool},
-    time::Instant,
 };
 
-pub(super) struct HostNetwork {
+pub(crate) struct HostNetwork {
     pub(super) config: VmNetwork,
     table: String,
     vmm_user: String,
     active: bool,
     capture_tap: String,
     inspection_tap: String,
-    pub(super) gate: Option<crate::packet_gate::PacketGate>,
 }
 
 impl HostNetwork {
-    pub(super) fn create(id: &str, vmm_user: &str) -> Result<Self> {
+    pub(crate) fn create(id: &str, vmm_user: &str, gateway_user: &str) -> Result<Self> {
         if !Path::new("/usr/sbin/nft").is_file() {
             return Err("--network proxy requires nftables (/usr/sbin/nft)".into());
         }
@@ -80,7 +74,6 @@ impl HostNetwork {
             active: true,
             capture_tap: format!("amc{}", &suffix[..10]),
             inspection_tap: format!("ami{}", &suffix[..10]),
-            gate: None,
         };
         let tap_result = checked(Command::new("/usr/sbin/ip").args([
             "tuntap",
@@ -98,10 +91,16 @@ impl HostNetwork {
         }
         let setup = (|| -> Result<()> {
             for name in [&network.capture_tap, &network.inspection_tap] {
-                checked(
-                    Command::new("/usr/sbin/ip")
-                        .args(["tuntap", "add", "dev", name, "mode", "tap"]),
-                )?;
+                checked(Command::new("/usr/sbin/ip").args([
+                    "tuntap",
+                    "add",
+                    "dev",
+                    name,
+                    "mode",
+                    "tap",
+                    "user",
+                    gateway_user,
+                ]))?;
                 let ipv6 = format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6");
                 if Path::new(&ipv6).exists() {
                     fs::write(ipv6, b"1")?;
@@ -172,29 +171,35 @@ impl HostNetwork {
         Ok(network)
     }
 
-    pub(super) fn start_policy(
-        &mut self,
-        backend: Backend,
-        profile: String,
-        run: String,
-        cancelled: Arc<AtomicBool>,
-        deadline: Instant,
-    ) -> Result<()> {
-        self.gate = Some(crate::packet_gate::PacketGate::start(
-            &self.config,
-            &self.capture_tap,
-            &self.inspection_tap,
-            backend,
-            profile,
-            run,
-            cancelled,
-            deadline,
-        )?);
-        Ok(())
+    pub(crate) fn config(&self) -> &VmNetwork {
+        &self.config
     }
 
-    pub(super) fn config(&self) -> &VmNetwork {
-        &self.config
+    pub(crate) fn detach(mut self) -> VmNetwork {
+        self.active = false;
+        self.config.clone()
+    }
+
+    pub(crate) fn remove_by_id(id: &str) -> Result<()> {
+        let suffix = id.strip_prefix(RUN_PREFIX).ok_or("invalid run ID")?;
+        if !crate::linux::valid_run_id(id) {
+            return Err("invalid run ID".into());
+        }
+        let mut network = Self {
+            config: VmNetwork {
+                tap: format!("amt{}", &suffix[..10]),
+                host_ip: String::new(),
+                guest_ip: String::new(),
+                guest_mac: String::new(),
+                host_mac: String::new(),
+            },
+            table: format!("am_{}", &suffix[..16]),
+            vmm_user: String::new(),
+            active: true,
+            capture_tap: format!("amc{}", &suffix[..10]),
+            inspection_tap: format!("ami{}", &suffix[..10]),
+        };
+        network.remove()
     }
 
     fn install_firewall(&self) -> Result<()> {
@@ -291,7 +296,6 @@ impl HostNetwork {
         if !self.active {
             return Ok(());
         }
-        self.gate = None;
         let mut errors = Vec::new();
         match command(Command::new("/usr/sbin/nft").args(["delete", "table", "inet", &self.table]))
         {

@@ -2,20 +2,18 @@ use crate::sandbox::Result;
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
-    path::Path,
     time::{Duration, Instant},
 };
 
 const MAX_RESPONSE: usize = 256 * 1024;
 
 pub fn request(
-    socket: &Path,
+    mut stream: UnixStream,
     method: &str,
     endpoint: &str,
     body: &[u8],
     deadline: Instant,
 ) -> Result<Vec<u8>> {
-    let mut stream = UnixStream::connect(socket)?;
     let timeout = deadline
         .checked_duration_since(Instant::now())
         .ok_or("API deadline exceeded")?
