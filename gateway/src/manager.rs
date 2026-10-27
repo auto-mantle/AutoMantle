@@ -16,7 +16,6 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-const SOCKET: &str = "/run/automantle-gateway/control.sock";
 const CONSOLE_LIMIT: usize = 256 * 1024;
 const REQUEST_LIMIT: usize = 64 * 1024;
 const MAX_ACTIVE_RUNS: usize = 4;
@@ -130,14 +129,16 @@ struct Defaults {
     tls: PathBuf,
     credentials: Option<PathBuf>,
 }
-impl Default for Defaults {
-    fn default() -> Self {
-        Self {
-            kernel: "/var/lib/automantle/kernel".into(),
-            rootfs: "/var/lib/automantle/linux.ext4".into(),
-            tls: "/var/lib/automantle/tls/tls.json".into(),
+impl Defaults {
+    fn load() -> Result<Self> {
+        let runs = crate::rootless::data_parent()?;
+        let data = runs.parent().ok_or("invalid data directory")?;
+        Ok(Self {
+            kernel: data.join("kernel"),
+            rootfs: data.join("linux.ext4"),
+            tls: data.join("tls/tls.json"),
             credentials: None,
-        }
+        })
     }
 }
 struct Manager {
@@ -672,8 +673,23 @@ impl Manager {
         for import in &self.imports {
             import.cancel.store(true, Ordering::Relaxed);
         }
+        for (id, task) in &self.tasks {
+            if !task.worker.is_finished() && record_guard(&task.record).state == "running" {
+                if let Err(error) = linux::request_shutdown(id) {
+                    eprintln!("run={id} guest shutdown request failed: {error}");
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while self.tasks.values().any(|task| !task.worker.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
         for task in self.tasks.values() {
-            task.cancel.store(true, Ordering::Relaxed);
+            if !task.worker.is_finished() {
+                task.cancel.store(true, Ordering::Relaxed);
+            }
         }
         for import in std::mem::take(&mut self.imports) {
             let _ = import.worker.join();

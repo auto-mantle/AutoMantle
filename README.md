@@ -1,58 +1,30 @@
-# AutoMantle
+﻿# AutoMantle
 
-AutoMantle runs agent workloads in local Linux VMs and lets you control their outbound HTTP requests from a dashboard.
+AutoMantle runs agent workloads in local Linux VMs and applies profile rules to their outbound HTTP requests.
 
-## Requirements
+## Run a compiled Linux release
 
-- An x86_64 Linux host with systemd, KVM (`/dev/kvm`), cgroup v2, and Landlock.
-- Rust 1.88+ with Cargo, Java 25, `curl`, and `sha256sum`. Install `iproute2` and `nftables` first if your host does not use `apt-get`.
-- A bootable guest kernel and raw ext4 Linux image with a serial console and your agent tools. AutoMantle does not create these guest files.
-
-The installer downloads Cloud Hypervisor, so it needs internet access.
-
-## Install and run
-
-Run these commands on the Linux host, from the repository root:
+The release archive contains the CLI, gateway, Java runtime and API, Cloud Hypervisor, and a prepared guest kernel and image. Extract it in a directory owned by your account, then run:
 
 ```sh
-cd gateway
-cargo build --release --locked
-sudo bash install-linux.sh "$(pwd)/target/release/automantle-gateway"
-cd ..
+tar -xzf automantle-linux-x86_64.tar.gz
+./automantle-linux-x86_64/bin/automantle up
+# Open http://localhost:8082
+./automantle-linux-x86_64/bin/automantle down
 ```
 
-Put your prepared guest files at the paths used by the dashboard:
+Run these commands as your normal user, without `sudo`. `up` starts the API and gateway as systemd user services. `down` shuts down their VMs and stops both services. Data stays under `~/.local/share/automantle/` or `XDG_DATA_HOME/automantle/`.
 
-```sh
-sudo install -o automantle -g automantle -m 0644 /path/to/guest-kernel /var/lib/automantle/kernel
-sudo install -o automantle -g automantle -m 0644 /path/to/guest.ext4 /var/lib/automantle/linux.ext4
-```
+The host needs Linux x86_64, a working systemd user manager with cgroup v2, Landlock, and read/write access to `/dev/kvm` and `/dev/vhost-vsock`. A host administrator may need to grant those device permissions once. AutoMantle does not ask for root privileges or install a root helper. Run `./automantle-linux-x86_64/bin/automantle-gateway doctor --cloud-hypervisor ./automantle-linux-x86_64/bin/cloud-hypervisor` to inspect prerequisites.
 
-For inspected HTTPS, create a local CA and install only its public `ca.pem` in the guest's trust store before using the VM:
+If port 8082 is occupied, set `AUTOMANTLE_PORT` when running `up`, for example `AUTOMANTLE_PORT=18082 ./automantle-linux-x86_64/bin/automantle up`. Open the URL printed by the command.
 
-```sh
-sudo -u automantle /usr/local/bin/automantle-gateway tls init-ca --directory /var/lib/automantle/tls
-```
-
-Log out and back in to activate the `automantle-control` group added by the installer. Return to the repository root, then start the API in one terminal:
-
-```sh
-cd api
-./mvnw spring-boot:run
-```
-
-Start the gateway in another terminal:
-
-```sh
-sudo systemctl start automantle-gateway.service
-```
-
-Open **http://localhost:8082** on the host. The API stores its SQLite database in `~/.local/share/automantle/` by default. To change the data directory, copy `.env.example` to `.env` in the repository root and set `AUTOMANTLE_DATA_DIR` before starting the API.
+A raw Git checkout is source code. Its builder supplies a bootable guest image and compiles the release; the CLI does not build a checkout. See [Getting started](docs/getting-started.md) and [release building](docs/reference.md#building-a-release).
 
 ## Use it
 
 1. In **Agent Profiles**, create a profile and add rules for the HTTP hosts, methods, and paths your workload needs. Requests without a matching rule are denied.
 2. In **Virtual Machines**, create a VM with that profile, start it, and open its terminal to run your workload.
-3. Check **Request History** for decisions. To discover needed connections interactively, enable **Setup Mode** on the VM and review prompts in **Approvals**.
+3. Check **Request History** for decisions. To discover supported connections interactively, enable **Setup Mode** and review prompts in **Approvals**.
 
 See the [full documentation](docs/index.md) for guest preparation, policies, credentials, and troubleshooting.

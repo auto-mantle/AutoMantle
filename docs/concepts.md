@@ -1,37 +1,27 @@
-# How AutoMantle works
+﻿# How AutoMantle works
 
 ```text
-Browser on Linux host ──> local dashboard/API ──> SQLite
-                               ^                    profiles, rules,
-                               |                    approvals, history
-                         policy evaluation
-                               |
-Guest VM ──> isolated network ──> gateway proxy ──> permitted destination
-    |                              |
-    +── Linux and agent harness    +── credential insertion, audit
+Local browser -> API/dashboard -> profiles, rules, approvals, history in SQLite
+                    |
+                    v
+             user-owned gateway -> policy proxy -> permitted destination
+                    ^
+                    | private VSOCK connection
+             guest loopback proxy -> workload in a VM without a network card
 ```
 
-The API manages policy and the dashboard. The gateway runs VMs and intercepts supported outbound HTTP traffic. The privileged helper performs narrowly scoped host setup for the gateway. Each VM is associated with exactly one agent profile, and the gateway asks the API to evaluate requests against that profile.
+The API manages policy and the dashboard. The gateway runs VMs and inspects supported outbound HTTP traffic. Each VM belongs to one agent profile, and the gateway asks the API to evaluate requests against that profile. The CLI starts the API and gateway as user services; each VM is a separate Cloud Hypervisor user service. No AutoMantle host process runs as root.
 
 ## Request decisions
 
-For an HTTP action, a rule matches its method, exact host, and path. The decision order is:
-
-1. A matching `DENY` rule denies the request.
-2. Otherwise, a matching `REQUIRE_APPROVAL` rule waits for a human decision.
-3. Otherwise, a matching `ALLOW` rule permits the request.
-4. With no matching rule, the request is denied.
-
-Invalid or unsupported actions are denied. During an active setup session, an otherwise unmatched **supported** request becomes a setup prompt instead of an immediate denial. An explicit deny still applies. See [profiles and policies](policies.md).
+For an HTTP action, a rule matches its method, exact host, and path. A matching `DENY` rule takes precedence; otherwise a `REQUIRE_APPROVAL` rule waits for a human decision, an `ALLOW` rule permits the request, and an unmatched request is denied. During a setup session, an otherwise unmatched supported request can become a prompt. See [profiles and policies](policies.md).
 
 ## Guest and host boundaries
 
-The guest VM runs your workload. The gateway has its own Unix control socket and a separate root helper socket. The dashboard talks to the local gateway through the API; the dashboard is intended for a local browser session. Managed credential values are stored by the gateway on the host and are not returned by the dashboard's credential listing.
+The guest VM runs your workload. It has no virtio network interface. A small guest process listens on `127.0.0.1:3128` and forwards HTTP proxy connections over VSOCK to that VM's private host policy proxy. Unsupported direct TCP, UDP, and ICMP traffic has no guest network route. The gateway's control socket and storage belong to the login account. Cloud Hypervisor's user service hides the account's home directory except for that VM's disk directory and executable; seccomp and Landlock remain enabled.
 
-The gateway's proxy supports inspected HTTP and, after local CA setup, HTTPS. It blocks private and special-use upstream destinations and IPv6-only destinations. Unsupported forwarding and protocols can fail closed. AutoMantle is a request control layer for the supported traffic path; prepare the guest and workload to use that path, and check [Request History](approvals.md#request-history) for the observed result.
+The proxy supports HTTP and, after CA preparation, inspected HTTPS. It blocks private and special-use upstream destinations and IPv6-only destinations. Request History records decisions seen by the proxy. Traffic that cannot reach the proxy is not represented as a packet count in new rootless VM runs.
 
 ## Persistence
 
-Profiles, rules, approvals, and request history are in the API's SQLite database. Managed credentials and VM disks are in gateway-owned storage. Dashboard VMs use saved disks so Linux files and installed tools can persist after a clean stop. A copied VM receives its own disk and settings. Deleting a VM deletes its saved files. Console tails and run records held by the gateway are temporary.
-
-These stores are separate: back up both the API data directory and gateway storage if you need to preserve a complete installation. See [operations](operations.md#data-and-backups).
+Profiles, rules, approvals, and request history are in the API SQLite database. Managed credentials and VM disks are in user-owned gateway storage. Dashboard VMs use saved disks so installed tools can persist after a clean stop. Console tails and run records held by the gateway are temporary. See [operations](operations.md#data-and-backups).

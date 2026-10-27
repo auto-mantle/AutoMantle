@@ -15,15 +15,11 @@ pub mod machines;
 #[cfg(target_os = "linux")]
 pub mod manager;
 #[cfg(target_os = "linux")]
-pub mod network_policy;
-#[cfg(target_os = "linux")]
-pub mod packet_gate;
-#[cfg(target_os = "linux")]
-pub mod privileged;
-#[cfg(target_os = "linux")]
 pub mod proxy;
 #[cfg(target_os = "linux")]
 pub mod request_lifecycle;
+#[cfg(target_os = "linux")]
+pub mod rootless;
 pub mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod storage;
@@ -31,3 +27,5 @@ pub mod storage;
 pub mod tls;
 #[cfg(target_os = "linux")]
 pub mod transport;
+#[cfg(target_os = "linux")]
+pub mod vsock;

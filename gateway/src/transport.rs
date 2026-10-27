@@ -1,8 +1,11 @@
 use crate::request_lifecycle::EndReason;
 use std::{
     io::{self, Read, Write},
-    net::TcpStream,
-    os::fd::AsRawFd,
+    net::{Shutdown, TcpStream},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::net::UnixStream,
+    },
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,8 +13,79 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+impl From<TcpStream> for Stream {
+    fn from(stream: TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+}
+impl From<UnixStream> for Stream {
+    fn from(stream: UnixStream) -> Self {
+        Self::Unix(stream)
+    }
+}
+impl Stream {
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+            Self::Unix(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_write_timeout(timeout),
+            Self::Unix(stream) => stream.set_write_timeout(timeout),
+        }
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.shutdown(how),
+            Self::Unix(stream) => stream.shutdown(how),
+        }
+    }
+    fn take_error(&self) -> io::Result<Option<io::Error>> {
+        match self {
+            Self::Tcp(stream) => stream.take_error(),
+            Self::Unix(stream) => stream.take_error(),
+        }
+    }
+}
+impl AsRawFd for Stream {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Tcp(stream) => stream.as_raw_fd(),
+            Self::Unix(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+impl Read for Stream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(bytes),
+            Self::Unix(stream) => stream.read(bytes),
+        }
+    }
+}
+impl Write for Stream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(bytes),
+            Self::Unix(stream) => stream.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.flush(),
+            Self::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
 pub struct Socket {
-    inner: TcpStream,
+    inner: Stream,
     stopped: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     lifetime: Instant,
@@ -19,12 +93,13 @@ pub struct Socket {
 }
 impl Socket {
     pub fn new(
-        inner: TcpStream,
+        inner: impl Into<Stream>,
         stopped: Arc<AtomicBool>,
         cancelled: Arc<AtomicBool>,
         lifetime: Instant,
         phase: Duration,
     ) -> io::Result<Self> {
+        let inner = inner.into();
         inner.set_read_timeout(Some(Duration::from_millis(250)))?;
         inner.set_write_timeout(Some(Duration::from_millis(250)))?;
         Ok(Self {
@@ -42,7 +117,7 @@ impl Socket {
         self.phase = self.lifetime;
     }
     pub fn finish(&mut self) {
-        let _ = self.inner.shutdown(std::net::Shutdown::Write);
+        let _ = self.inner.shutdown(Shutdown::Write);
         self.phase = Instant::now() + Duration::from_millis(500);
         let mut remaining = 128 * 1024;
         let mut buffer = [0_u8; 8192];

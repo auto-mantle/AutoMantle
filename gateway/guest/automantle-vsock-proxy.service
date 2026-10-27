@@ -1,0 +1,17 @@
+[Unit]
+Description=AutoMantle guest HTTP proxy bridge
+ConditionKernelCommandLine=automantle_proxy=http://127.0.0.1:3128
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=/usr/local/bin/automantle-vsock-proxy
+Restart=on-failure
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,15 +1,16 @@
 use crate::{
     backend::Backend,
-    hypervisor_api, privileged,
+    hypervisor_api,
     proxy::Proxy,
+    rootless,
     sandbox::{Result, RunRequest},
+    vsock::VsockBridge,
 };
-use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{OpenOptionsExt, PermissionsExt},
         net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -24,12 +25,9 @@ use std::{
 
 mod console;
 pub(crate) mod host_command;
-pub(crate) mod network;
-mod network_client;
 pub(crate) mod preflight;
 use console::ConsolePump;
-use host_command::{checked, command};
-use network_client::NetworkLease;
+use host_command::checked;
 pub use preflight::doctor;
 
 const RUN_PREFIX: &str = "automantle-vm-";
@@ -88,10 +86,10 @@ struct Run {
     destroyed: bool,
     service_started: bool,
     console: Option<ConsolePump>,
-    network: Option<NetworkLease>,
+    disk_directory: PathBuf,
+    bridge: Option<VsockBridge>,
     proxy: Option<Proxy>,
-    persistent_root: Option<File>,
-    runtime_root: Option<PathBuf>,
+    persistent_root: Option<PathBuf>,
 }
 
 impl Run {
@@ -99,23 +97,27 @@ impl Run {
         if !valid_run_id(&id) {
             return Err("invalid run ID".into());
         }
-        let directory = Path::new("/run").join(&id);
-        privileged::request(json!({"command":"create-run","id":id}))?;
+        let (directory, disk_directory) = rootless::create_run(&id)?;
         Ok(Self {
             id,
             directory,
+            disk_directory,
             destroyed: false,
             service_started: false,
             console: None,
-            network: None,
+            bridge: None,
             proxy: None,
             persistent_root: None,
-            runtime_root: None,
         })
     }
 
     fn socket(&self) -> PathBuf {
         self.directory.join("api.sock")
+    }
+
+    fn vsock_cid(&self) -> Result<u32> {
+        let suffix = run_suffix(&self.id)?;
+        Ok(u32::from_str_radix(&suffix[..8], 16)?.max(3))
     }
 
     fn prepare(
@@ -127,7 +129,7 @@ impl Run {
         if let Some(initramfs) = &request.initramfs {
             copy_image(
                 initramfs,
-                &self.directory.join("initramfs"),
+                &self.disk_directory.join("initramfs"),
                 true,
                 cancelled,
                 deadline,
@@ -135,43 +137,25 @@ impl Run {
         }
         copy_image(
             &request.kernel,
-            &self.directory.join("kernel"),
+            &self.disk_directory.join("kernel"),
             true,
             cancelled,
             deadline,
         )?;
-        if request.saved_disk.is_some() {
-            let source = if request.preparation {
-                request.rootfs.clone()
-            } else {
-                let path = request
-                    .rootfs
-                    .parent()
-                    .ok_or("invalid saved disk path")?
-                    .join(format!("{}.runtime", self.id));
-                self.runtime_root = Some(path.clone());
-                copy_image(&request.rootfs, &path, false, cancelled, deadline)?;
-                path
-            };
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(self.directory.join("rootfs"))?;
-            self.persistent_root = Some(OpenOptions::new().read(true).open(source)?);
-        } else {
-            copy_image(
-                &request.rootfs,
-                &self.directory.join("rootfs"),
-                request.saved_disk.is_none(),
-                cancelled,
-                deadline,
-            )?;
+        copy_image(
+            &request.rootfs,
+            &self.disk_directory.join("rootfs"),
+            request.saved_disk.is_none(),
+            cancelled,
+            deadline,
+        )?;
+        if request.preparation {
+            self.persistent_root = Some(request.rootfs.clone());
         }
         if let Some(template) = &request.scratch_template {
             copy_image(
                 template,
-                &self.directory.join("scratch"),
+                &self.disk_directory.join("scratch"),
                 false,
                 cancelled,
                 deadline,
@@ -181,61 +165,47 @@ impl Run {
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
-                .open(self.directory.join("scratch"))?;
+                .open(self.disk_directory.join("scratch"))?;
             disk.set_len(request.scratch_mib * 1024 * 1024)?;
         }
         fs::write(
-            self.directory.join("vm.json"),
-            serde_json::to_vec_pretty(&request.vm_config(
-                &self.directory,
-                self.network.as_ref().map(NetworkLease::config),
-            ))?,
-        )?;
-        privileged::request_with_file(
-            json!({
-                "command":"prepare-run", "id":self.id,
-                "saved":self.persistent_root.is_some(),
-                "initramfs":request.initramfs.is_some(),
-            }),
-            self.persistent_root.as_ref(),
+            self.disk_directory.join("vm.json"),
+            serde_json::to_vec_pretty(
+                &request.vm_config_rootless(
+                    &self.directory,
+                    &self.disk_directory,
+                    request
+                        .proxy_network
+                        .then(|| self.vsock_cid())
+                        .transpose()?,
+                ),
+            )?,
         )?;
         Ok(())
     }
 
     fn start(&mut self, request: &RunRequest, lifetime: Duration) -> Result<()> {
+        rootless::start_vmm(
+            &self.id,
+            request,
+            request.memory_mib,
+            request.vcpus,
+            lifetime,
+        )?;
         self.service_started = true;
-        privileged::request(json!({
-            "command":"start-vmm", "id":self.id,
-            "settings":{
-                "memoryMib":request.memory_mib,
-                "vcpus":request.vcpus,
-                "lifetimeSeconds":if request.timeout.is_zero() {0} else {lifetime.as_secs().max(1)},
-                "network":self.network.is_some(),
-                "saved":request.saved_disk.is_some(),
-                "preparation":request.preparation,
-                "initramfs":request.initramfs.is_some(),
-                "hypervisor":request.hypervisor,
-            }
-        }))?;
         Ok(())
     }
 
     fn state(&self) -> Result<String> {
-        let output = checked(Command::new("/usr/bin/systemctl").args([
-            "show",
-            &self.id,
-            "--property=SubState",
-            "--value",
-        ]))?;
-        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        rootless::state(&self.id)
     }
 
     fn pump_console(&mut self) -> Result<()> {
         if let Some(proxy) = &self.proxy {
             proxy.check()?;
         }
-        if let Some(gate) = self.network.as_ref().and_then(|n| n.gate.as_ref()) {
-            gate.check()?;
+        if let Some(bridge) = &self.bridge {
+            bridge.check()?;
         }
         if let Some(reader) = self.console.take_if(|reader| reader.is_finished()) {
             reader.finish()?;
@@ -243,67 +213,78 @@ impl Run {
         Ok(())
     }
 
-    fn release_persistent_root(&mut self) -> Result<()> {
+    fn release_persistent_root(&mut self, clean: bool) -> Result<()> {
         let Some(source) = self.persistent_root.as_ref() else {
             return Ok(());
         };
-        privileged::request_with_file(
-            json!({"command":"release-saved","id":self.id}),
-            Some(source),
-        )?;
+        let parent = source.parent().ok_or("invalid saved disk path")?;
+        let disk = self.disk_directory.join("rootfs");
+        let destination = if clean {
+            source.clone()
+        } else {
+            parent.join(format!("rootfs.{}.recovery", self.id))
+        };
+        File::open(&disk)?.sync_all()?;
+        match fs::rename(&disk, &destination) {
+            Ok(()) => (),
+            Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+                let staged = parent.join(format!("rootfs.{}.stage", self.id));
+                let result = (|| -> Result<()> {
+                    copy_image(
+                        &disk,
+                        &staged,
+                        false,
+                        &AtomicBool::new(false),
+                        Instant::now() + Duration::from_secs(3600),
+                    )?;
+                    File::open(&staged)?.sync_all()?;
+                    fs::rename(&staged, &destination)?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&staged);
+                }
+                result?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        File::open(parent)?.sync_all()?;
+        if !clean {
+            eprintln!(
+                "run={} saved disk unchanged; recover VM writes from {}",
+                self.id,
+                destination.display()
+            );
+        }
         self.persistent_root = None;
         Ok(())
     }
-
-    fn remove_runtime_root(&mut self) -> Result<()> {
-        let Some(path) = &self.runtime_root else {
-            return Ok(());
-        };
-        match fs::remove_file(path) {
-            Ok(()) => (),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
-        self.runtime_root = None;
-        Ok(())
-    }
-
-    fn cleanup(&mut self) -> Result<()> {
+    fn cleanup(&mut self, clean: bool) -> Result<()> {
         if self.destroyed {
             return Ok(());
         }
         if let Some(proxy) = self.proxy.as_ref() {
             proxy.stop();
         }
-        if let Some(gate) = self.network.as_ref().and_then(|n| n.gate.as_ref()) {
-            gate.stop();
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.stop();
         }
         if self.service_started {
-            privileged::request(json!({"command":"stop-vmm","id":self.id}))?;
+            rootless::stop_vmm(&self.id)?;
             self.service_started = false;
         }
         let mut errors = Vec::new();
         if let Err(error) = self.console.take().map_or(Ok(()), ConsolePump::finish) {
             errors.push(format!("console: {error}"));
         }
+        self.bridge = None;
         self.proxy = None;
-        if let Err(error) = self.release_persistent_root() {
+        if let Err(error) = self.release_persistent_root(clean) {
             errors.push(format!("saved disk: {error}"));
         }
-        if self.persistent_root.is_none()
-            && let Err(error) = self.remove_runtime_root()
-        {
-            errors.push(format!("runtime disk: {error}"));
-        }
-        if let Some(network) = self.network.as_mut() {
-            match network.remove() {
-                Ok(()) => self.network = None,
-                Err(error) => errors.push(format!("network: {error}")),
-            }
-        }
-        if self.persistent_root.is_none() && self.runtime_root.is_none() && self.network.is_none() {
-            match privileged::request(json!({"command":"destroy-run","id":self.id})) {
-                Ok(_) => self.destroyed = true,
+        if self.persistent_root.is_none() {
+            match rootless::destroy_run(&self.id) {
+                Ok(()) => self.destroyed = true,
                 Err(error) => errors.push(format!("run directory: {error}")),
             }
         }
@@ -317,7 +298,7 @@ impl Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
+        if let Err(error) = self.cleanup(false) {
             eprintln!("cleanup failed for {}: {error}", self.id);
         }
     }
@@ -328,7 +309,7 @@ pub fn request_shutdown(id: &str) -> Result<()> {
         return Err("Invalid run ID".into());
     }
     hypervisor_api::request(
-        privileged::connect_vmm(id, "api")?,
+        rootless::connect_vmm(id, "api")?,
         "PUT",
         "vm.power-button",
         &[],
@@ -348,7 +329,7 @@ pub fn run(
         return Err("VM launch must run through the unprivileged gateway".into());
     }
     backend.validate_profile(&request.agent_profile_id)?;
-    preflight::check(&request.hypervisor)?;
+    preflight::check(&request.hypervisor, request.proxy_network)?;
     let lifetime = if request.timeout.is_zero() {
         Duration::from_secs(100 * 365 * 24 * 60 * 60)
     } else {
@@ -375,27 +356,26 @@ pub fn run(
     let mut vm = Run::create(id)?;
     let networking = request.proxy_network;
     if networking {
-        let mut network = NetworkLease::create(&vm.id)?;
-        network.start_policy(
-            backend.clone(),
-            request.agent_profile_id.clone(),
-            vm.id.clone(),
+        let proxy_socket = vm.directory.join("proxy.sock");
+        vm.proxy = Some(Proxy::start_unix(
+            crate::proxy::ProxyConfig {
+                backend,
+                profile: request.agent_profile_id.clone(),
+                tls,
+                credentials,
+                cancelled: Arc::clone(&cancelled),
+                deadline,
+                setup_mode: request.setup_mode,
+            },
+            &proxy_socket,
+        )?);
+        vm.bridge = Some(VsockBridge::start(
+            &vm.directory.join("vsock"),
+            &proxy_socket,
             Arc::clone(&cancelled),
             deadline,
-        )?;
-        let host_ip = network.config().host_ip.clone();
-        vm.network = Some(network);
-        vm.proxy = Some(Proxy::start(crate::proxy::ProxyConfig {
-            bind_ip: &host_ip,
-            backend,
-            profile: request.agent_profile_id.clone(),
-            tls,
-            credentials,
-            cancelled: Arc::clone(&cancelled),
-            deadline,
-            setup_mode: request.setup_mode,
-        })?);
-        eprintln!("run={} proxy=http://{}:3128", vm.id, host_ip);
+        )?);
+        eprintln!("run={} proxy=guest-loopback-vsock:3128", vm.id);
     }
     eprintln!(
         "run={} state=preparing network={}",
@@ -410,18 +390,14 @@ pub fn run(
     let result = (|| -> Result<()> {
         vm.prepare(&request, &cancelled, deadline)?;
         check_deadline(&cancelled, deadline)?;
-        if let Some(gate) = vm
-            .network
-            .as_ref()
-            .and_then(|network| network.gate.as_ref())
-        {
-            gate.check()?;
+        if let Some(bridge) = &vm.bridge {
+            bridge.check()?;
         }
         vm.start(&request, deadline.saturating_duration_since(Instant::now()))?;
         let boot_deadline = deadline.min(Instant::now() + Duration::from_secs(15));
         loop {
             check_deadline(&cancelled, boot_deadline)?;
-            if privileged::connect_vmm(&vm.id, "api")
+            if rootless::connect_vmm(&vm.id, "api")
                 .and_then(|socket| {
                     hypervisor_api::request(socket, "GET", "vmm.ping", &[], boot_deadline)
                 })
@@ -430,25 +406,31 @@ pub fn run(
                 break;
             }
             if vm.state()? == "failed" {
-                return Err(format!("VMM failed to start; inspect journalctl -u {}", vm.id).into());
+                return Err(format!(
+                    "VMM failed to start; inspect journalctl --user -u {}",
+                    vm.id
+                )
+                .into());
             }
             thread::sleep(Duration::from_millis(50));
         }
         hypervisor_api::request(
-            privileged::connect_vmm(&vm.id, "api")?,
+            rootless::connect_vmm(&vm.id, "api")?,
             "PUT",
             "vm.create",
-            &serde_json::to_vec(
-                &request.vm_config(&vm.directory, vm.network.as_ref().map(NetworkLease::config)),
-            )?,
+            &serde_json::to_vec(&request.vm_config_rootless(
+                &vm.directory,
+                &vm.disk_directory,
+                request.proxy_network.then(|| vm.vsock_cid()).transpose()?,
+            ))?,
             boot_deadline,
         )?;
-        let serial = privileged::connect_vmm(&vm.id, "serial")?;
+        let serial = rootless::connect_vmm(&vm.id, "serial")?;
         serial.set_nonblocking(true)?;
         event(RunEvent::Terminal(serial.try_clone()?));
         vm.console = Some(ConsolePump::start(serial, Arc::clone(&event))?);
         hypervisor_api::request(
-            privileged::connect_vmm(&vm.id, "api")?,
+            rootless::connect_vmm(&vm.id, "api")?,
             "PUT",
             "vm.boot",
             &[],
@@ -462,6 +444,7 @@ pub fn run(
             let state = vm.state()?;
             if matches!(state.as_str(), "exited" | "dead" | "failed") {
                 let output = checked(Command::new("/usr/bin/systemctl").args([
+                    "--user",
                     "show",
                     &vm.id,
                     "--property=Result",
@@ -470,7 +453,7 @@ pub fn run(
                 let result = String::from_utf8(output.stdout)?;
                 if state == "failed" || result.trim() != "success" {
                     return Err(format!(
-                        "VMM stopped: {}; inspect journalctl -u {}",
+                        "VMM stopped: {}; inspect journalctl --user -u {}",
                         result.trim(),
                         vm.id
                     )
@@ -486,7 +469,7 @@ pub fn run(
     if result.is_err() {
         let _ = vm.pump_console();
     }
-    let cleanup = vm.cleanup();
+    let cleanup = vm.cleanup(result.is_ok());
     eprintln!(
         "run={} state={}",
         vm.id,
@@ -567,53 +550,6 @@ pub(crate) fn copy_image(
     Ok(())
 }
 
-pub(crate) fn remove_run_directory(directory: &Path, id: &str) -> Result<()> {
-    run_suffix(id)?;
-    if directory != Path::new("/run").join(id) {
-        return Err("refusing cleanup outside the exact run directory".into());
-    }
-    match fs::symlink_metadata(directory) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-        Ok(meta) if meta.file_type().is_symlink() => {
-            let target = fs::read_link(directory)?;
-            let private = Path::new("/run/private").join(id);
-            if target != private && target != Path::new("private").join(id) {
-                return Err("refusing cleanup of an unexpected runtime link".into());
-            }
-            let parent = Path::new("/run/private");
-            let parent_meta = fs::symlink_metadata(parent)?;
-            if !parent_meta.is_dir()
-                || parent_meta.uid() != 0
-                || parent_meta.mode() & 0o022 != 0
-                || fs::canonicalize(parent)? != parent
-            {
-                return Err("refusing cleanup through an untrusted private directory".into());
-            }
-            remove_exact_directory(&private)?;
-            fs::remove_file(directory)?;
-            return Ok(());
-        }
-        Ok(meta) if !meta.is_dir() => {
-            return Err("refusing cleanup of a replaced run directory".into());
-        }
-        _ => (),
-    }
-    remove_exact_directory(directory)
-}
-
-fn remove_exact_directory(directory: &Path) -> Result<()> {
-    let meta = match fs::symlink_metadata(directory) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        other => other?,
-    };
-    if !meta.is_dir() || fs::canonicalize(directory)? != directory {
-        return Err("refusing cleanup through a symlink".into());
-    }
-    fs::remove_dir_all(directory)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{new_uuid, run_suffix};
@@ -627,6 +563,45 @@ mod tests {
         assert!(run_suffix("vm-0123456789abcdef0123456789abcdef").is_err());
     }
 
+    #[test]
+    fn saved_disk_commits_on_clean_stop_and_preserves_recovery_on_failure() {
+        use super::Run;
+        use std::fs;
+        let base =
+            std::env::temp_dir().join(format!("automantle-disk-test-{}", std::process::id()));
+        let saved = base.join("saved");
+        let run = base.join("run");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&saved).unwrap();
+        fs::create_dir(&run).unwrap();
+        let source = saved.join("rootfs");
+        let private = run.join("rootfs");
+        fs::write(&source, b"original").unwrap();
+        fs::write(&private, b"updated").unwrap();
+        let mut vm = Run {
+            id: "automantle-vm-0123456789abcdef0123456789abcdef".into(),
+            directory: base.clone(),
+            destroyed: true,
+            service_started: false,
+            console: None,
+            disk_directory: run.clone(),
+            bridge: None,
+            proxy: None,
+            persistent_root: Some(source.clone()),
+        };
+        vm.release_persistent_root(true).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"updated");
+        assert!(!private.exists());
+        fs::write(&private, b"recoverable").unwrap();
+        vm.persistent_root = Some(source.clone());
+        vm.release_persistent_root(false).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"updated");
+        assert_eq!(
+            fs::read(saved.join(format!("rootfs.{}.recovery", vm.id))).unwrap(),
+            b"recoverable"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     fn generated_uuid_has_v4_version_and_variant() {
         let id = new_uuid().unwrap();

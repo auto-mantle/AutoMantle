@@ -5,11 +5,13 @@ use crate::{
     request_lifecycle::{EndReason, RequestLifecycle, RequestMonitor},
     sandbox::Result,
     tls::Tls,
-    transport::Socket,
+    transport::{Socket, Stream},
 };
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
+    os::unix::net::UnixListener,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,7 +32,6 @@ use request::{Request, parse_request, writes_body};
 pub(crate) use request::{valid_host, valid_method, valid_path};
 use response::{credential_response, response_line, stream_response};
 
-const PROXY_PORT: u16 = 3128;
 const MAX_HEADER: usize = 32 * 1024;
 const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 const MAX_DOWNLOAD_RESPONSE: u64 = 128 * 1024 * 1024;
@@ -40,8 +41,7 @@ pub struct Proxy {
     thread: Option<JoinHandle<()>>,
     context: Arc<Context>,
 }
-pub(crate) struct ProxyConfig<'a> {
-    pub bind_ip: &'a str,
+pub(crate) struct ProxyConfig {
     pub backend: Backend,
     pub profile: String,
     pub tls: Option<Tls>,
@@ -67,7 +67,7 @@ impl Context {
             && !self.cancelled.load(Ordering::Relaxed)
             && Instant::now() < self.deadline
     }
-    fn socket(&self, stream: TcpStream) -> Result<Socket> {
+    fn socket(&self, stream: impl Into<Stream>) -> Result<Socket> {
         Ok(Socket::new(
             stream,
             Arc::clone(&self.stopped),
@@ -87,9 +87,9 @@ impl Proxy {
         }
         Ok(())
     }
-    pub(crate) fn start(config: ProxyConfig<'_>) -> Result<Self> {
+    pub(crate) fn start_unix(config: ProxyConfig, path: &Path) -> Result<Self> {
+        let listener = UnixListener::bind(path)?;
         let ProxyConfig {
-            bind_ip,
             backend,
             profile,
             tls,
@@ -98,7 +98,6 @@ impl Proxy {
             deadline,
             setup_mode,
         } = config;
-        let listener = TcpListener::bind((bind_ip, PROXY_PORT))?;
         listener.set_nonblocking(true)?;
         let stopped = Arc::new(AtomicBool::new(false));
         let setup_session = if setup_mode {
@@ -130,8 +129,8 @@ impl Proxy {
                             i += 1;
                         }
                     }
-                    match listener.accept() {
-                        Ok((mut client, _)) => {
+                    match listener.accept().map(|(stream, _)| Stream::from(stream)) {
+                        Ok(mut client) => {
                             if workers.len() >= 16 {
                                 let _ = client.set_write_timeout(Some(Duration::from_secs(1)));
                                 let _ = reply(&mut client, 503, "proxy request limit reached");
@@ -275,7 +274,7 @@ fn read_header(reader: &mut impl Read) -> Result<Vec<u8>> {
     }
     Err("request header too large".into())
 }
-fn handle(mut stream: TcpStream, shared: &Context) -> Result<()> {
+fn handle(mut stream: Stream, shared: &Context) -> Result<()> {
     let credentials = match shared.credentials.snapshot() {
         Ok(credentials) => credentials,
         Err(_) => {
@@ -301,11 +300,7 @@ fn handle(mut stream: TcpStream, shared: &Context) -> Result<()> {
     }
     result
 }
-fn handle_observed(
-    stream: TcpStream,
-    context: &Context,
-    observation: &mut Observation,
-) -> Result<()> {
+fn handle_observed(stream: Stream, context: &Context, observation: &mut Observation) -> Result<()> {
     let mut socket = context.socket(stream)?;
     let raw = read_header(&mut socket)?;
     observation.capture(&raw, None);

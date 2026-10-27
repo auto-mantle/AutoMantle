@@ -8,27 +8,38 @@ use std::{
 };
 
 pub fn doctor(binary: &Path) -> Result<()> {
-    check(binary)?;
-    println!("OK: Cloud Hypervisor v53.0, KVM API 12, systemd, cgroup v2, and Landlock.");
-    println!("The gateway runs unprivileged; its root helper sets up isolated VM services.");
+    check(binary, true)?;
+    println!(
+        "OK: Cloud Hypervisor v53.0, user KVM and VSOCK access, systemd user manager, cgroup v2, and Landlock."
+    );
     Ok(())
 }
 
-pub(crate) fn check(binary: &Path) -> Result<()> {
-    let meta =
-        fs::metadata(binary).map_err(|e| format!("Cloud Hypervisor {}: {e}", binary.display()))?;
-    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.mode() & 0o111 == 0 {
-        return Err(
-            "Cloud Hypervisor must be a root-owned executable, not group/world writable".into(),
-        );
+pub(crate) fn check(binary: &Path, need_vsock: bool) -> Result<()> {
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("run AutoMantle as an ordinary user, not root".into());
     }
-    for parent in fs::canonicalize(binary)?.ancestors().skip(1) {
+    let uid = unsafe { libc::geteuid() };
+    let canonical = fs::canonicalize(binary)?;
+    let meta = fs::metadata(&canonical)?;
+    if !meta.is_file()
+        || ![0, uid].contains(&meta.uid())
+        || meta.mode() & 0o022 != 0
+        || meta.mode() & 0o111 == 0
+    {
+        return Err("Cloud Hypervisor must be an executable owned by root or the current user and not group/world writable".into());
+    }
+    for parent in canonical.ancestors().skip(1) {
         let meta = fs::metadata(parent)?;
-        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-            return Err("untrusted Cloud Hypervisor parent directory".into());
+        if !meta.is_dir() || ![0, uid].contains(&meta.uid()) || meta.mode() & 0o022 != 0 {
+            return Err(format!(
+                "untrusted Cloud Hypervisor parent directory: {}",
+                parent.display()
+            )
+            .into());
         }
     }
-    let version = checked(Command::new(binary).arg("--version"))?;
+    let version = checked(Command::new(&canonical).arg("--version"))?;
     if String::from_utf8_lossy(&version.stdout).lines().next() != Some("cloud-hypervisor v53.0") {
         return Err("this gateway currently supports Cloud Hypervisor v53.0; validate other versions before upgrading".into());
     }
@@ -36,7 +47,7 @@ pub(crate) fn check(binary: &Path) -> Result<()> {
         .read(true)
         .write(true)
         .open("/dev/kvm")
-        .map_err(|e| format!("cannot open /dev/kvm: {e}"))?;
+        .map_err(|e| format!("cannot open /dev/kvm as the current user: {e}"))?;
     let api_version = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xAE00, 0 as libc::c_ulong) };
     if api_version != 12 {
         return Err(format!(
@@ -44,6 +55,13 @@ pub(crate) fn check(binary: &Path) -> Result<()> {
             std::io::Error::last_os_error()
         )
         .into());
+    }
+    if need_vsock {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/vhost-vsock")
+            .map_err(|e| format!("cannot open /dev/vhost-vsock as the current user: {e}"))?;
     }
     if unsafe {
         libc::syscall(
@@ -65,6 +83,7 @@ pub(crate) fn check(binary: &Path) -> Result<()> {
             return Err(format!("missing cgroup v2 controller: {required}").into());
         }
     }
+    checked(Command::new("/usr/bin/systemctl").args(["--user", "show-environment"]))?;
     checked(Command::new("/usr/bin/systemd-run").arg("--version"))?;
     Ok(())
 }

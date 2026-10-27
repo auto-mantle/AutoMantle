@@ -1,5 +1,5 @@
 use super::{
-    Defaults, Manager, REQUEST_LIMIT, SOCKET,
+    Defaults, Manager, REQUEST_LIMIT,
     client::{client_request, terminal_cli},
 };
 use crate::{
@@ -13,7 +13,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
-        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -49,7 +49,7 @@ impl Drop for SocketGuard {
         }
     }
 }
-fn bind(path: &Path, group: Option<u32>) -> Result<(UnixListener, SocketGuard)> {
+fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     if !path.is_absolute()
         || path
             .components()
@@ -73,8 +73,23 @@ fn bind(path: &Path, group: Option<u32>) -> Result<(UnixListener, SocketGuard)> 
         }
     }
     let m = fs::symlink_metadata(parent)?;
-    if m.mode() & 0o077 != 0 && !(group == Some(m.gid()) && m.mode() & 0o077 == 0o010) {
+    if m.mode() & 0o077 != 0 {
         return Err("socket parent must have mode 0700".into());
+    }
+    if let Ok(existing) = fs::symlink_metadata(path) {
+        if !existing.file_type().is_socket() || existing.uid() != unsafe { libc::geteuid() } {
+            return Err("refusing to replace an untrusted control socket".into());
+        }
+        match UnixStream::connect(path) {
+            Ok(_) => return Err("gateway control socket is already active".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => (),
+            Err(error) => return Err(error.into()),
+        }
+        let current = fs::symlink_metadata(path)?;
+        if current.dev() != existing.dev() || current.ino() != existing.ino() {
+            return Err("control socket changed during startup".into());
+        }
+        fs::remove_file(path)?;
     }
     let listener = UnixListener::bind(path)?;
     let m = fs::symlink_metadata(path)?;
@@ -84,17 +99,6 @@ fn bind(path: &Path, group: Option<u32>) -> Result<(UnixListener, SocketGuard)> 
         inode: m.ino(),
     };
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    if let Some(group) = group {
-        for target in [parent, path] {
-            use std::os::unix::ffi::OsStrExt;
-            let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
-            if unsafe { libc::chown(target.as_ptr(), libc::geteuid(), group) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o710))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
-    }
     Ok((listener, guard))
 }
 
@@ -141,10 +145,10 @@ pub fn cli(args: &[String]) -> Result<()> {
         .map(String::as_str)
         .ok_or("command is required")?;
     if command == "start" && unsafe { libc::geteuid() } == 0 {
-        return Err("run the gateway as the automantle service user, not root".into());
+        return Err("run the gateway as an ordinary user, not root".into());
     }
     let mut values = args[1..].to_vec();
-    let mut socket = PathBuf::from(SOCKET);
+    let mut socket = crate::rootless::runtime_parent()?.join("control.sock");
     if let Some(index) = values.iter().position(|a| a == "--socket") {
         socket = values
             .get(index + 1)
@@ -153,14 +157,12 @@ pub fn cli(args: &[String]) -> Result<()> {
         values.drain(index..index + 2);
     }
     if command == "start" {
-        crate::privileged::request(json!({"command":"ping"}))?;
         let values = sandbox::options(
             &values,
             &[
                 "--gateway-config",
                 "--cloud-hypervisor",
                 "--disk-directory",
-                "--control-group",
                 "--default-kernel",
                 "--default-rootfs",
                 "--tls-ca-config",
@@ -178,19 +180,13 @@ pub fn cli(args: &[String]) -> Result<()> {
                 .map(String::as_str)
                 .unwrap_or("/usr/local/bin/cloud-hypervisor"),
         );
-        let group = values
-            .get("--control-group")
-            .map(|name| -> Result<u32> {
-                let name = std::ffi::CString::new(name.as_str())?;
-                let group = unsafe { libc::getgrnam(name.as_ptr()) };
-                if group.is_null() {
-                    return Err("unknown local control group".into());
-                }
-                Ok(unsafe { (*group).gr_gid })
-            })
-            .transpose()?;
-        let (listener, _guard) = bind(&socket, group)?;
+        let (listener, _guard) = bind(&socket)?;
         let backend = Backend::load(&config)?;
+        let defaults = Defaults::load()?;
+        let default_disk_directory = crate::rootless::data_parent()?
+            .parent()
+            .ok_or("invalid data directory")?
+            .join("vms");
         let mut manager = Manager {
             backend,
             config,
@@ -199,21 +195,21 @@ pub fn cli(args: &[String]) -> Result<()> {
                 directory: values
                     .get("--disk-directory")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| "/var/lib/automantle/vms".into()),
+                    .unwrap_or(default_disk_directory),
             },
             defaults: Defaults {
                 kernel: values
                     .get("--default-kernel")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| Defaults::default().kernel),
+                    .unwrap_or_else(|| defaults.kernel),
                 rootfs: values
                     .get("--default-rootfs")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| Defaults::default().rootfs),
+                    .unwrap_or_else(|| defaults.rootfs),
                 tls: values
                     .get("--tls-ca-config")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| Defaults::default().tls),
+                    .unwrap_or_else(|| defaults.tls),
                 credentials: values.get("--credentials-config").map(PathBuf::from),
             },
             machine_runs: BTreeMap::new(),

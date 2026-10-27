@@ -5,7 +5,7 @@ export async function historyView(container, context) {
   const errors = node("div");
   const list = node("div", { className: "stack" }, empty("Loading request history…"));
   const profile = node("select", { className: "form-input", "aria-label": "Filter by agent profile" }, node("option", { value: "" }, "All agent profiles"));
-  const help = node("p", { className: "muted small" }, "Updates every 2 seconds. Keeps up to 10,000 requests for 30 days. Network packets are grouped with exact counts. Headers, queries, and payloads are not recorded. Paths may contain application identifiers.");
+  const help = node("p", { className: "muted small" }, "Updates every 2 seconds. Keeps up to 10,000 requests for 30 days. Headers, queries, and payloads are not recorded. Paths may contain application identifiers.");
   let loading = false, clearing = false, nextBefore = null, rows = [], older = false, generation = 0;
   const more = button("Load older requests", () => refresh(true));
   more.hidden = true;

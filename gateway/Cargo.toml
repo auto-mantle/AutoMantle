@@ -3,6 +3,7 @@ name = "automantle-gateway"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+autobins = false
 
 [dependencies]
 serde_json = { version = "1", features = ["arbitrary_precision"] }
@@ -32,5 +33,5 @@ name = "automantle-gateway"
 path = "src/main.rs"
 
 [[bin]]
-name = "automantle-helper"
-path = "src/bin/automantle-helper.rs"
+name = "automantle"
+path = "src/bin/automantle.rs"

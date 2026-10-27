@@ -41,7 +41,7 @@ fn print_usage() {
     println!(
         "Usage:
   automantle-gateway doctor [--cloud-hypervisor PATH]
-  automantle-gateway tls init-ca --directory /var/lib/automantle/tls
+  automantle-gateway tls init-ca --directory ~/.local/share/automantle/tls
   automantle-gateway start --gateway-config PATH [--cloud-hypervisor PATH]
   automantle-gateway create-disk --name NAME --rootfs PATH
   automantle-gateway list-disks
@@ -54,14 +54,13 @@ fn print_usage() {
   automantle-gateway stop
   automantle-gateway version
 
-Start runs as the automantle service user and requires the installed root helper.
-The installer provides systemd units for both services; launch commands use the running gateway.
+Start runs as your ordinary user; automantle up starts it with the API.
+The gateway starts one Cloud Hypervisor user service per VM.
 Each VM has its own Cloud Hypervisor process. Network is disabled by default.
 Requires Linux, systemd, cgroup v2, Landlock, and Cloud Hypervisor v53.0.
 
 Options:
-  --control-group GROUP     Start only: trusted local app group allowed to manage this gateway
-  --disk-directory PATH     Private VM environments, start only (default: /var/lib/automantle/vms)
+  --disk-directory PATH     Private VM environments, start only (default: user AutoMantle data directory)
   --default-kernel PATH     Host standard kernel for saved VMs, start only
   --default-rootfs PATH     Clean Linux template for new VMs, start only
   --tls-ca-config PATH      Start: default host HTTPS CA; launch: per-run CA
@@ -80,14 +79,14 @@ Options:
   --cmdline TEXT           Guest boot arguments (saved disks default to rw; other roots to ro)
 
 Imported source images are never modified. Direct --rootfs runs have a read-only root.
-Saved disks persist independently of VM runs. Preparation writes the saved installation;
+Saved disks persist independently of VM runs. Preparation writes a private copy and commits it after a clean stop;
 runtime writes a private copy that is discarded on stop. Preparation needs exclusive disk access.
 Use a clean shutdown inside the guest to flush its filesystem before ending preparation.
 Console tail is available through logs RUN_ID; supervisor status goes to stderr.
 Terminal attaches to the guest serial console; Ctrl+] detaches without stopping the VM.
 Start runs in the foreground. Use another terminal for commands. Stop also stops its VMs.
 Up to four VMs can run together. Run records and console tails are held in memory.
-All manager commands accept --socket PATH (default: /run/automantle-gateway/control.sock).
+All manager commands accept --socket PATH (default: $XDG_RUNTIME_DIR/automantle/control.sock).
 A successful VM shutdown does NOT prove that the agent task succeeded.
 HTTPS requires --tls-ca-config and a prepared guest image trusting the public CA.
 Shared-host-folder, passthrough, and arbitrary VMM options are not exposed."
@@ -274,41 +273,35 @@ impl RunRequest {
         })
     }
 
-    pub fn vm_config(&self, directory: &Path, network: Option<&VmNetwork>) -> Value {
-        let net = network.map_or_else(Vec::new, |network| {
-            vec![json!({
-                "tap": network.tap,
-                "ip": null,
-                "mask": null,
-                "offload_tso": false,
-                "offload_ufo": false,
-                "offload_csum": false,
-                "mac": network.guest_mac,
-                "num_queues": 2,
-            })]
-        });
+    pub fn vm_config_rootless(
+        &self,
+        runtime: &Path,
+        disks: &Path,
+        vsock_cid: Option<u32>,
+    ) -> Value {
         let mut config = json!({
             "cpus": {"boot_vcpus": self.vcpus, "max_vcpus": self.vcpus},
             "memory": {"size": self.memory_mib * 1024 * 1024},
-            "payload": {"kernel": directory.join("kernel"), "cmdline": self.cmdline},
+            "payload": {"kernel": disks.join("kernel"), "cmdline": self.cmdline},
             "disks": [
-                {"path": directory.join("rootfs"), "readonly": self.saved_disk.is_none(), "image_type": "Raw"},
-                {"path": directory.join("scratch"), "readonly": false, "image_type": "Raw"}
+                {"path": disks.join("rootfs"), "readonly": self.saved_disk.is_none(), "image_type": "Raw"},
+                {"path": disks.join("scratch"), "readonly": false, "image_type": "Raw"}
             ],
-            "net": net, "fs": [], "devices": [],
-            "serial": {"mode": "Socket", "socket": directory.join("serial.sock")},
+            "net": [], "fs": [], "devices": [],
+            "serial": {"mode": "Socket", "socket": runtime.join("serial.sock")},
             "console": {"mode": "Off"}, "landlock_enable": true,
         });
         if self.initramfs.is_some() {
-            config["payload"]["initramfs"] = json!(directory.join("initramfs"));
+            config["payload"]["initramfs"] = json!(disks.join("initramfs"));
         }
-        if let Some(network) = network {
-            config["landlock_rules"] = json!([{
-                "path": format!("/sys/class/net/{}/tun_flags", network.tap), "access": "r"
-            }]);
+        if let Some(cid) = vsock_cid {
+            config["vsock"] = json!({
+                "cid": cid,
+                "socket": runtime.join("vsock")
+            });
             config["payload"]["cmdline"] = json!(format!(
-                "{} ip={}::{}:255.255.255.252::eth0:off automantle_proxy=http://{}:3128",
-                self.cmdline, network.guest_ip, network.host_ip, network.host_ip
+                "{} automantle_proxy=http://127.0.0.1:3128",
+                self.cmdline
             ));
         }
         config
@@ -332,16 +325,6 @@ pub(crate) fn valid_uuid(value: &str) -> bool {
                 byte.is_ascii_hexdigit()
             }
         })
-}
-
-#[derive(Clone, Debug)]
-#[cfg_attr(target_os = "linux", derive(serde::Serialize, serde::Deserialize))]
-pub struct VmNetwork {
-    pub tap: String,
-    pub host_ip: String,
-    pub guest_ip: String,
-    pub guest_mac: String,
-    pub host_mac: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -383,6 +366,43 @@ mod tests {
         assert!(!valid_uuid("12345678-1234-1234-1234-123456789abg"));
     }
 
+    #[test]
+    fn rootless_vm_has_no_network_card_and_only_explicit_vsock() {
+        let arguments = [
+            "--kernel",
+            "/kernel",
+            "--rootfs",
+            "/rootfs",
+            "--gateway-config",
+            "/gateway.json",
+            "--agent-profile-id",
+            "12345678-1234-1234-1234-123456789abc",
+        ];
+        let parse = |extra: &[&str]| {
+            RunRequest::parse(
+                &arguments
+                    .iter()
+                    .chain(extra)
+                    .map(|s| (*s).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let runtime = std::path::Path::new("/run/user/1000/automantle/vm");
+        let disks = std::path::Path::new("/home/user/.local/share/automantle/runs/vm");
+        let disabled = parse(&[]).vm_config_rootless(runtime, disks, None);
+        assert_eq!(disabled["net"], serde_json::json!([]));
+        assert!(disabled.get("vsock").is_none());
+        let proxy = parse(&["--network", "proxy"]).vm_config_rootless(runtime, disks, Some(42));
+        assert_eq!(proxy["net"], serde_json::json!([]));
+        assert_eq!(proxy["vsock"]["cid"], 42);
+        assert!(
+            proxy["payload"]["cmdline"]
+                .as_str()
+                .unwrap()
+                .contains("automantle_proxy=http://127.0.0.1:3128")
+        );
+    }
     #[test]
     fn launch_options_require_one_root_and_explicit_proxy_for_setup() {
         let base = [

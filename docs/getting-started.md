@@ -1,68 +1,35 @@
-# Getting started
+﻿# Getting started
 
-This guide takes you from the source repository to a local dashboard and a first VM. Commands in this page run on the **Linux host** unless stated otherwise.
+## Host requirements
 
-## Prerequisites
+Use an x86_64 Linux host with systemd, a working systemd user manager, cgroup v2 `cpu`, `memory`, and `pids` controllers, Landlock, and Cloud Hypervisor-compatible KVM. Your normal account must be able to open `/dev/kvm` and `/dev/vhost-vsock` for reading and writing. If device permissions are missing, ask the host administrator to configure them; AutoMantle does not elevate itself.
 
-- x86_64 Linux with systemd, cgroup v2 (`cpu`, `memory`, and `pids` controllers), Landlock, and usable `/dev/kvm`.
-- Rust 1.88 or newer and Cargo to build the gateway; Java 25 to run the API. The API includes Maven wrapper scripts.
-- `curl` and `sha256sum`. The installer can install `iproute2` and `nftables` using `apt-get` if they are missing, so use a host where that package manager is available or install those tools yourself.
-- A **bootable guest kernel** and a **raw ext4 Linux filesystem image** compatible with Cloud Hypervisor and a serial console. The installer does **not** download or build these guest assets. The default paths are `/var/lib/automantle/kernel` and `/var/lib/automantle/linux.ext4`.
-- A prepared guest image with your desired agent harness and provider login, if your workload needs them. For inspected HTTPS, also install the gateway's public CA into the guest trust store; see [HTTPS inspection](#enable-inspected-https).
+## Start and stop the compiled release
 
-The gateway installer downloads a pinned Cloud Hypervisor v53.0 executable, checks its SHA-256, and installs it locally. An internet connection is required for this step.
-
-## Build and install the gateway
-
-From the repository root on the Linux host:
+Download the Linux release archive from the project's GitHub Releases page and extract it in a directory you own. The archive already contains the Java runtime, API, gateway, Cloud Hypervisor v53.0, guest kernel, and raw ext4 guest image. No Cargo, Maven, or compilation is needed on the user's host.
 
 ```sh
-cd gateway
-cargo build --release --locked
-sudo bash install-linux.sh "$(pwd)/target/release/automantle-gateway"
+tar -xzf automantle-linux-x86_64.tar.gz
+./automantle-linux-x86_64/bin/automantle up
 ```
 
-The build creates `automantle-gateway` and `automantle-helper` in the same directory. The installer checks KVM, creates the `automantle` service user and control group, installs the binaries and systemd units, and runs `automantle-gateway doctor`. It enables the helper socket and gateway service but leaves the gateway service stopped until the API is running.
+Open the URL printed by `up` in a browser on the same host. The default is `http://localhost:8082`. If that port is occupied, run `AUTOMANTLE_PORT=18082 ./automantle-linux-x86_64/bin/automantle up` instead.
 
-Place your guest kernel and base filesystem at the default paths, owned and readable as required by the gateway service user. The installer creates `/var/lib/automantle` and `/var/lib/automantle/vms`, but it does not place either guest file there. If you use different paths, configure the gateway with `--default-kernel` and `--default-rootfs` when starting it; see [CLI and configuration](reference.md).
-
-## Start the API and dashboard
-
-From the repository root, start the API in a separate terminal:
+When finished:
 
 ```sh
-cd api
-./mvnw spring-boot:run
+./automantle-linux-x86_64/bin/automantle down
 ```
 
-The API binds to `127.0.0.1:8082` by default. It reads the optional repository-root `.env` file and stores its SQLite database under the Java process user's `~/.local/share/automantle/` directory unless `AUTOMANTLE_DATA_DIR` is set. Keep the same process user and data directory across restarts.
-
-Start the gateway after the API is listening:
-
-```sh
-sudo systemctl start automantle-gateway.service
-systemctl status automantle-gateway.service
-```
-
-Open `http://localhost:8082` **on the host**. The management API accepts loopback requests for local hostnames; it is not configured as a public dashboard. If the API user was added to `automantle-control` during installation, log out and back in so the new group membership takes effect before using VM controls.
-
-## Enable inspected HTTPS
-
-The gateway can inspect HTTPS only when it has a local CA and the guest trusts its public certificate. Generate the CA as the `automantle` service user:
-
-```sh
-sudo -u automantle /usr/local/bin/automantle-gateway tls init-ca --directory /var/lib/automantle/tls
-```
-
-This creates `ca.pem` (public guest certificate), `ca-key.pem` (private signing key), and `tls.json` (host configuration). The gateway's default TLS configuration path is `/var/lib/automantle/tls/tls.json`. Install **only** `ca.pem` in the guest's trust store while preparing the image, then restart the gateway. Keep the private key on the host. Without this setup, HTTPS inspection is disabled and HTTPS connections through the proxy fail.
+`down` asks running guests to shut down, waits briefly, then force stops those that remain. It stops the gateway and API while keeping profiles, credentials, and saved VM disks. You can run `up` again later.
 
 ## First profile and VM
 
-1. In **Agent Profiles**, create a profile for one workload, such as `code-reviewer-bot`.
-2. Open the profile and add a narrow `ALLOW` rule for the destination, method, and path your harness needs. Unknown supported requests are denied in normal mode; see [policy rules](policies.md).
-3. In **Virtual Machines**, create a VM, select the profile, choose memory and CPU count, and start it.
-4. Open the VM terminal and configure or run the harness inside the prepared guest. Watch [Request History](approvals.md#request-history) to see decisions.
+1. In **Agent Profiles**, create a profile for one workload.
+2. Add narrow `ALLOW` rules for its required destination, method, and path. Unknown supported requests are denied in normal mode.
+3. In **Virtual Machines**, create a VM with that profile and start it.
+4. Open the VM terminal and run your workload. Review [Request History](approvals.md#request-history).
 
-For interactive discovery of a harness's connections, enable **Setup Mode** on the VM. Unknown supported requests then prompt you in the dashboard. An approval in setup mode saves an exact rule to the profile. See [setup mode](policies.md#setup-mode).
+The release guest image must contain the tools and agent harness you intend to run. The release builder installs the guest-side VSOCK bridge; VM traffic reaches the host policy proxy through that bridge, with no VM network interface. A custom guest image must provide the same bridge and trust the public AutoMantle CA for inspected HTTPS. See [Virtual machines](virtual-machines.md#guest-preparation).
 
-If VM creation fails, first verify that the guest kernel and filesystem exist at the configured paths, then check `sudo journalctl -u automantle-gateway.service -n 100 --no-pager`. The [troubleshooting guide](operations.md#troubleshooting) has more checks.
+For diagnostics, use `./automantle-linux-x86_64/bin/automantle-gateway doctor --cloud-hypervisor ./automantle-linux-x86_64/bin/cloud-hypervisor` and [Operations](operations.md).

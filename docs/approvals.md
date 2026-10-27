@@ -15,6 +15,6 @@ An approval can become **expired** if its setup session ends, its VM stops, or i
 
 ## Request history
 
-The **Request History** tab records policy outcomes and gateway network events. It can show the profile, host, method, path, outcome, reason, matched rule IDs, and related approval where those fields are available. Use it to diagnose a blocked connection or confirm that a permitted request reached the policy layer.
+The **Request History** tab records policy outcomes from requests handled by the gateway proxy. It can show the profile, host, method, path, outcome, reason, matched rule IDs, and related approval where those fields are available. Use it to diagnose a blocked connection or confirm that a permitted request reached the policy layer.
 
 The API retains at most 10,000 history records for up to 30 days and pages through them. The dashboard has a clear history action. Request history is an audit aid, not a replacement for the workload's own logs or a proof that its task succeeded.

@@ -53,7 +53,9 @@ public class VmGatewayService {
             @Value("${app.gateway.socket}") String socket,
             @Value("${app.gateway.binary}") String binary,
             @Value("${app.gateway.external-terminal}") String terminal) {
-        this.socket = socket;
+        this.socket = socket.isBlank() && System.getenv("XDG_RUNTIME_DIR") != null
+                ? Path.of(System.getenv("XDG_RUNTIME_DIR"), "automantle", "control.sock").toString()
+                : socket;
         this.binary = binary;
         this.terminal = terminal;
     }
