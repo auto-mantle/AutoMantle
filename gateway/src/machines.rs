@@ -6,8 +6,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::Path,
     sync::atomic::AtomicBool,
 };
@@ -21,6 +21,53 @@ pub struct Settings {
     pub vcpu_count: u64,
     #[serde(default)]
     pub setup: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn iso_creation_keeps_source_and_persists_boot_choice() {
+        let base = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(format!(".automantle-iso-test-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+        let source = base.join("installer.iso");
+        let mut bytes = vec![0u8; 0x9000];
+        bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+        fs::write(&source, &bytes).unwrap();
+        let store = Store {
+            directory: base.join("vms"),
+        };
+        let settings = Settings {
+            name: "Test".into(),
+            agent_profile_id: "12345678-1234-4234-8234-123456789abc".into(),
+            memory_mib: 2048,
+            vcpu_count: 2,
+            setup: false,
+        };
+        assert!(
+            store
+                .create_iso_machine(settings.clone(), Path::new("relative.iso"))
+                .is_err()
+        );
+        let vm = store.create_iso_machine(settings.clone(), &source).unwrap();
+        assert!(!vm.install_complete);
+        assert_eq!(
+            fs::metadata(store.disk(&vm.id).unwrap().join("rootfs"))
+                .unwrap()
+                .len(),
+            32 * 1024 * 1024 * 1024
+        );
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        store.mark_install_complete(&vm.id).unwrap();
+        let updated = store.update_machine(&vm.id, settings).unwrap();
+        assert!(updated.install_complete);
+        assert_eq!(updated.iso_path, vm.iso_path);
+        store.delete_machine(&vm.id).unwrap();
+        fs::remove_dir(base.join("vms")).unwrap();
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(base).unwrap();
+    }
 }
 impl Settings {
     pub fn validate(&self) -> Result<()> {
@@ -45,6 +92,10 @@ pub struct Machine {
     pub id: String,
     #[serde(flatten)]
     pub settings: Settings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso_path: Option<String>,
+    #[serde(default)]
+    pub install_complete: bool,
 }
 impl Store {
     pub fn machine(&self, id: &str) -> Result<Machine> {
@@ -122,7 +173,12 @@ impl Store {
         settings.validate()?;
         let id = linux::new_run_id()?.replacen("automantle-vm-", "vm-", 1);
         self.create_cancellable(&id, base, cancel)?;
-        let machine = Machine { id, settings };
+        let machine = Machine {
+            id,
+            settings,
+            iso_path: None,
+            install_complete: true,
+        };
         if let Err(error) = self.save_machine(&machine) {
             let _ = fs::remove_file(self.disk(&machine.id)?.join("rootfs"));
             let _ = fs::remove_dir(self.disk(&machine.id)?);
@@ -130,23 +186,90 @@ impl Store {
         }
         Ok(machine)
     }
+    pub fn create_iso_machine(&self, settings: Settings, iso: &Path) -> Result<Machine> {
+        settings.validate()?;
+        if !iso.is_absolute()
+            || iso
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_none_or(|ext| !ext.eq_ignore_ascii_case("iso"))
+        {
+            return Err("Choose an absolute path to an ISO file on this machine".into());
+        }
+        let iso = fs::canonicalize(iso)?;
+        let mut file = File::open(&iso)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.len() < 0x8006
+            || metadata.len() > 64 * 1024 * 1024 * 1024
+        {
+            return Err("ISO must be a regular file between 32 KiB and 64 GiB".into());
+        }
+        file.seek(SeekFrom::Start(0x8001))?;
+        let mut signature = [0u8; 5];
+        file.read_exact(&mut signature)?;
+        if &signature != b"CD001" {
+            return Err("Selected file is not an ISO image".into());
+        }
+        let id = linux::new_run_id()?.replacen("automantle-vm-", "vm-", 1);
+        let directory = self.disk(&id)?;
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let result = (|| -> Result<Machine> {
+            let disk = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join("rootfs"))?;
+            disk.set_len(32 * 1024 * 1024 * 1024)?;
+            disk.sync_all()?;
+            let machine = Machine {
+                id,
+                settings,
+                iso_path: Some(iso.to_string_lossy().into_owned()),
+                install_complete: false,
+            };
+            self.save_machine(&machine)?;
+            Ok(machine)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(directory.join("machine.json"));
+            let _ = fs::remove_file(directory.join("rootfs"));
+            let _ = fs::remove_dir(&directory);
+        }
+        result
+    }
     pub fn copy_machine(&self, id: &str, name: String, cancel: &AtomicBool) -> Result<Machine> {
-        let mut settings = self.machine(id)?.settings;
+        let source = self.machine(id)?;
+        let mut settings = source.settings;
         settings.name = name;
         settings.validate()?;
         let lease = self.acquire(id, true)?;
-        self.create_machine(settings, &lease.path, cancel)
+        let mut copy = self.create_machine(settings, &lease.path, cancel)?;
+        copy.iso_path = source.iso_path;
+        copy.install_complete = source.install_complete;
+        self.save_machine(&copy)?;
+        Ok(copy)
     }
     pub fn update_machine(&self, id: &str, settings: Settings) -> Result<Machine> {
-        self.machine(id)?;
+        let previous = self.machine(id)?;
         settings.validate()?;
         let _lease = self.acquire(id, true)?;
         let machine = Machine {
             id: id.to_owned(),
             settings,
+            iso_path: previous.iso_path,
+            install_complete: previous.install_complete,
         };
         self.save_machine(&machine)?;
         Ok(machine)
+    }
+    pub fn mark_install_complete(&self, id: &str) -> Result<()> {
+        let mut machine = self.machine(id)?;
+        if machine.iso_path.is_none() {
+            return Err("VM has no installer ISO".into());
+        }
+        machine.install_complete = true;
+        self.save_machine(&machine)
     }
     pub fn delete_machine(&self, id: &str) -> Result<()> {
         self.machine(id)?;

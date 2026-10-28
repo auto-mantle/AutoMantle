@@ -196,14 +196,7 @@ mod linux {
         let hypervisor = release_file(&base, "bin/cloud-hypervisor")?;
         let java = release_file(&base, "runtime/bin/java")?;
         let jar = release_file(&base, "app/api.jar")?;
-        let kernel = release_file(&base, "share/guest/kernel")?;
-        let rootfs = release_file(&base, "share/guest/linux.ext4")?;
         rootless::runtime_parent()?;
-        output(
-            Command::new(&gateway)
-                .args(["doctor", "--cloud-hypervisor"])
-                .arg(&hypervisor),
-        )?;
         let socket = rootless::runtime_parent()?.join("control.sock");
         let config = config_file(port)?;
         let data = rootless::data_parent()?;
@@ -231,6 +224,20 @@ mod linux {
         )?;
         let result = (|| -> Result<()> {
             wait_for(|| api_ready(port), API_UNIT)?;
+            let mut gateway_environment = vec![(
+                "XDG_DATA_HOME".into(),
+                data_home.to_string_lossy().into_owned(),
+            )];
+            for key in [
+                "DISPLAY",
+                "WAYLAND_DISPLAY",
+                "XAUTHORITY",
+                "DBUS_SESSION_BUS_ADDRESS",
+            ] {
+                if let Ok(value) = env::var(key) {
+                    gateway_environment.push((key.into(), value));
+                }
+            }
             let gateway_started = start_unit(
                 GATEWAY_UNIT,
                 &gateway,
@@ -240,15 +247,8 @@ mod linux {
                     config.to_string_lossy().into_owned(),
                     "--cloud-hypervisor".into(),
                     hypervisor.to_string_lossy().into_owned(),
-                    "--default-kernel".into(),
-                    kernel.to_string_lossy().into_owned(),
-                    "--default-rootfs".into(),
-                    rootfs.to_string_lossy().into_owned(),
                 ],
-                &[(
-                    "XDG_DATA_HOME".into(),
-                    data_home.to_string_lossy().into_owned(),
-                )],
+                &gateway_environment,
             )?;
             if let Err(error) = wait_for(|| gateway_ready(&socket), GATEWAY_UNIT) {
                 if gateway_started {

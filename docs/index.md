@@ -2,11 +2,11 @@
 
 AutoMantle provides a local dashboard for Linux VMs that run agent workloads. Each VM belongs to an **agent profile**. The gateway inspects supported outbound HTTP requests and applies that profile's rules.
 
-The compiled Linux release contains three parts:
+AutoMantle has three parts:
 
 - **Dashboard and API** — a Spring Boot application that stores profiles, rules, approvals, and request history in SQLite.
 - **Gateway and CLI** — Rust executables that start and stop the app, run VMs as user services, and enforce outbound request rules.
-- **Guest VM** — a Linux image with a loopback VSOCK proxy bridge. Its tools and harness depend on the release image.
+- **Guest VM** — a user-supplied Linux installation. Its tools and harness depend on the image selected when the VM is created.
 
 Start with [installation and first run](getting-started.md). Then read [how it works](concepts.md) and [profile policies](policies.md).
 
@@ -21,4 +21,4 @@ Start with [installation and first run](getting-started.md). Then read [how it w
 | Keep API keys outside the VM | [Credentials](credentials.md) |
 | Diagnose services or back up data | [Operations and troubleshooting](operations.md) |
 
-The dashboard manages local VMs on one Linux host. AutoMantle does not sign in to an AI provider or install an agent harness at runtime. The release image must contain those tools and the public CA if inspected HTTPS is needed.
+The dashboard manages local VMs on one Linux host. AutoMantle does not sign in to an AI provider or install an agent harness at runtime. The user's guest installation must contain those tools and the public CA if inspected HTTPS is needed.

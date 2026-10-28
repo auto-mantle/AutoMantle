@@ -17,6 +17,8 @@ pub mod manager;
 #[cfg(target_os = "linux")]
 pub mod proxy;
 #[cfg(target_os = "linux")]
+pub mod qemu;
+#[cfg(target_os = "linux")]
 pub mod request_lifecycle;
 #[cfg(target_os = "linux")]
 pub mod rootless;

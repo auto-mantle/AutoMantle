@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+export QEMU_MODULE_DIR="$root/qemu/modules"
+exec "$root/qemu/lib/ld-linux-x86-64.so.2" --library-path "$root/qemu/lib" \
+    "$root/qemu/bin/qemu-system-x86_64" -L "$root/qemu/share/qemu" "$@"

@@ -35,3 +35,11 @@ path = "src/main.rs"
 [[bin]]
 name = "automantle"
 path = "src/bin/automantle.rs"
+
+[[bin]]
+name = "automantle-proxy-stdio"
+path = "src/bin/automantle-proxy-stdio.rs"
+
+[[bin]]
+name = "automantle-bundle-qemu"
+path = "../release/bundle-qemu.rs"

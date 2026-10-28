@@ -78,15 +78,39 @@ export async function vmsView(container, context) {
   }
   let allProfiles = [];
   const editor = node("div");
+  async function browseIso(input) {
+    const dialog = node("dialog", { className: "confirm-dialog iso-browser", "aria-label": "Select OS ISO" });
+    const listing = node("div", { className: "stack" }), location = node("p"), browseErrors = node("div");
+    const load = async directory => {
+      try {
+        const reply = await apiRequest("/vms/iso-files", jsonRequest("POST", { directory }));
+        location.textContent = reply.directory;
+        listing.replaceChildren(button("Parent directory", () => load(reply.parent)),
+          ...reply.entries.map(entry => button(`${entry.directory ? "Folder: " : ""}${entry.name}`, () => {
+            if (entry.directory) void load(entry.path);
+            else { input.value = entry.path; dialog.close(); }
+          })));
+        browseErrors.replaceChildren();
+      } catch (error) { notice(browseErrors, error); }
+    };
+    dialog.append(node("h3", {}, "Select OS ISO"), location, browseErrors, listing,
+      button("Cancel", () => dialog.close()));
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    document.body.append(dialog); dialog.showModal(); await load("");
+  }
   function settingsForm(vm = null) {
     const profiles = node("select", { name: "agentProfileId", required: true, className: "form-input" },
       node("option", { value: "" }, "Choose Agent Profile"),
       ...allProfiles.map(p => node("option", { value: p.id }, p.name)));
     profiles.value = vm?.agentProfileId ?? "";
     const setup = node("input", { type: "checkbox", name: "setup", checked: vm?.setup ?? false });
+    const iso = field("OS installer ISO on this machine", "isoPath", "", {
+      required: true, help: "Select an ISO you downloaded, or enter its full local path."
+    });
     return makeForm(vm ? "Edit VM" : "Create VM", [
       field("Name", "name", vm?.name ?? "", { required: true, maxlength: 80 }),
-      node("p", { className: "small muted" }, "Linux · Files and installed tools remain when this VM stops."),
+      vm ? null : node("div", {}, iso, button("Browse this machine", () => browseIso(iso.querySelector("input")))),
+      node("p", { className: "small muted" }, "AutoMantle creates the virtual disk. Your installed OS and files remain when this VM stops."),
       node("label", { className: "field" }, node("span", {}, "Agent Profile"), profiles),
       field("Memory (MiB)", "memoryMib", String(vm?.memoryMib ?? 2048), { type: "number", min: 128, max: 65536, required: true }),
       field("CPUs", "vcpuCount", String(vm?.vcpuCount ?? 2), { type: "number", min: 1, max: 64, required: true }),
@@ -115,7 +139,8 @@ export async function vmsView(container, context) {
       const reply = await apiRequest(`/vms/${vm.id}/${action}`, { method: "POST" });
       errors.replaceChildren();
       await refresh();
-      if (action === "start" && !disposed) await attach({ ...reply, id: reply.runId });
+      if (["start", "reinstall"].includes(action) && reply.terminalReady && !disposed)
+        await attach({ ...reply, id: reply.runId });
     } catch (error) { notice(errors, error); }
   }
   async function refresh() {
@@ -128,7 +153,7 @@ export async function vmsView(container, context) {
       const active = !["stopped", "failed"].includes(vm.state);
       const controls = node("div", { className: "actions" });
       if (!active) {
-        controls.append(button("Start", () => act(vm, "start"), "button approve"),
+        controls.append(button(vm.isoPath && !vm.installComplete ? "Install OS" : "Start", () => act(vm, "start"), "button approve"),
           button("Edit", () => editor.replaceChildren(settingsForm(vm))),
           button("Copy", () => copyForm(vm)),
           button("Delete", async () => {
@@ -136,6 +161,9 @@ export async function vmsView(container, context) {
             try { await apiRequest(`/vms/${vm.id}`, { method: "DELETE" }); if (attachedId === vm.runId) closeTerminal(); await refresh(); }
             catch (error) { notice(errors, error); }
           }, "button danger"));
+        if (vm.isoPath && vm.installComplete) controls.append(button("Boot installer again", () => act(vm, "reinstall")));
+        if (vm.isoPath && !vm.installComplete && vm.runId && vm.state === "stopped")
+          controls.append(button("Installation finished — boot from disk", () => act(vm, "complete-installation")));
       } else {
         if (vm.state === "running") controls.append(button("Stop", () => act(vm, "stop"), "button danger"));
         if (vm.terminalReady) controls.append(button("Open terminal", () => attach({ ...vm, id: vm.runId })),
@@ -148,9 +176,10 @@ export async function vmsView(container, context) {
         }, "button danger"));
       }
       return node("article", { className: "card" }, heading(vm.name, badge(vm.state.toUpperCase())),
-        node("p", {}, `Linux · ${vm.vcpuCount} CPU${vm.vcpuCount === 1 ? "" : "s"} · ${vm.memoryMib} MiB RAM · Profile: ${profileNames.get(vm.agentProfileId) ?? "Profile unavailable"}`),
+        node("p", {}, `${vm.isoPath ? (vm.installComplete ? "OS installed" : "OS installation needed") : "Linux"} · ${vm.vcpuCount} CPU${vm.vcpuCount === 1 ? "" : "s"} · ${vm.memoryMib} MiB RAM · Profile: ${profileNames.get(vm.agentProfileId) ?? "Profile unavailable"}`),
+        vm.isoPath ? node("p", { className: "small muted" }, "The VM opens in a window on this machine. Guest HTTP proxy: http://10.0.2.100:3128") : null,
         vm.error ? node("p", { className: "notice" }, displayMessage(vm.error)) : null, controls);
-    }) : [empty("No VMs yet. Create one with Linux included.")]));
+    }) : [empty("No VMs yet.")]));
   }
   container.replaceChildren(node("div", { className: "actions page-actions" },
     button("Create VM", () => editor.replaceChildren(settingsForm()), "button primary")),

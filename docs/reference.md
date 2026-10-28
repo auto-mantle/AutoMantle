@@ -30,4 +30,17 @@ The API listens on `127.0.0.1`. Its gateway socket is supplied by the CLI. Brows
 
 ## Building a release
 
-Maintainers build on Linux x86_64 with Rust 1.88+, a JDK 25, Maven wrapper dependencies, `cc`, and `debugfs`. Set `AUTOMANTLE_JAVA_HOME`, `AUTOMANTLE_CLOUD_HYPERVISOR`, `AUTOMANTLE_GUEST_KERNEL`, and `AUTOMANTLE_GUEST_IMAGE`, then run `bash release/build-linux.sh`. The guest image must be an offline ext4 Linux image with systemd and `/usr/local/bin`; the builder copies it and installs the guest VSOCK bridge and service. The script packages the compiled components under `dist/automantle-linux-x86_64.tar.gz` and records checksums. The image still needs the agent tools desired for the release and, for HTTPS inspection, the public CA in its trust store. Source-checkout users build these components themselves.
+Maintainers build on Ubuntu 24.04 x86_64 with Rust 1.88+, a JDK 25, Maven wrapper dependencies, `cc`, `ldd`, and the `qemu-system-x86` and `qemu-system-gui` packages. Set `AUTOMANTLE_JAVA_HOME` and `AUTOMANTLE_CLOUD_HYPERVISOR`, then run `bash release/build-linux.sh`. The Rust packaging helper bundles QEMU, its modules, firmware, and shared libraries. It packages the compiled components under `dist/automantle-linux-x86_64.tar.gz` and records checksums. The archive contains no guest operating system. Source-checkout users can use system QEMU or set `AUTOMANTLE_QEMU_BINARY` when starting the gateway.
+
+### Publish through GitHub Actions
+
+The [Linux release workflow](../.github/workflows/release-linux.yml) runs when a `v*` tag is pushed. It downloads the pinned Cloud Hypervisor v53.0 binary, builds and tests the Rust and Java code, packages a Java 25 runtime, checks the archive, and publishes the archive and its `.sha256` file as GitHub Release assets. No guest OS URL or hash is needed. Release users do not need a host Java or Rust installation.
+
+After the desired commit is ready, create and push a version tag, for example:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Check the workflow run before sharing the release. GitHub limits each release asset to less than 2 GiB; the workflow fails before publication if the compressed archive exceeds that limit. Building locally with `release/build-linux.sh` remains available before tagging.

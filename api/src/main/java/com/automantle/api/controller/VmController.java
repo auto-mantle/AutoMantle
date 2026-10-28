@@ -18,6 +18,9 @@ import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -38,11 +41,35 @@ public class VmController {
     }
 
     public record Settings(
-            String name, UUID agentProfileId, int memoryMib, int vcpuCount, boolean setup) {}
+            String name, UUID agentProfileId, int memoryMib, int vcpuCount, boolean setup,
+            String isoPath) {}
 
     public record CopyVm(String name) {}
 
     public record Input(List<Integer> data) {}
+
+    public record Browse(String directory) {}
+
+    @PostMapping("/iso-files")
+    public Map<String, Object> browse(@RequestBody Browse request) throws IOException {
+        Path directory = Path.of(request.directory() == null || request.directory().isBlank()
+                ? System.getProperty("user.home") : request.directory()).toRealPath();
+        if (!Files.isDirectory(directory)) {
+            throw new IllegalArgumentException("Choose a directory on this machine");
+        }
+        try (var entries = Files.list(directory)) {
+            var files = entries.filter(path -> Files.isReadable(path)
+                            && (Files.isDirectory(path) || path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".iso")))
+                    .sorted(Comparator.<Path, Boolean>comparing(path -> !Files.isDirectory(path))
+                            .thenComparing(path -> path.getFileName().toString(), String.CASE_INSENSITIVE_ORDER))
+                    .limit(1000)
+                    .map(path -> Map.<String, Object>of("name", path.getFileName().toString(),
+                            "path", path.toString(), "directory", Files.isDirectory(path)))
+                    .toList();
+            return Map.of("directory", directory.toString(), "parent",
+                    directory.getParent() == null ? directory.toString() : directory.getParent().toString(), "entries", files);
+        }
+    }
 
     @GetMapping
     public JsonNode list() throws IOException {
@@ -51,7 +78,14 @@ public class VmController {
 
     @PostMapping
     public JsonNode create(@RequestBody Settings request) throws IOException {
-        return gateway.command(Map.of("command", "create-machine", "settings", settings(request)));
+        if (request.isoPath() == null || request.isoPath().isBlank()) {
+            throw new IllegalArgumentException("Select a local OS ISO file for this VM");
+        }
+        return gateway.command(
+                Map.of(
+                        "command", "create-machine",
+                        "settings", settings(request),
+                        "isoPath", request.isoPath().trim()));
     }
 
     @PutMapping("/{id}")
@@ -88,6 +122,16 @@ public class VmController {
     @PostMapping("/{id}/start")
     public JsonNode start(@PathVariable String id) throws IOException {
         return gateway.command(Map.of("command", "start-machine", "id", machineId(id)));
+    }
+
+    @PostMapping("/{id}/reinstall")
+    public JsonNode reinstall(@PathVariable String id) throws IOException {
+        return gateway.command(Map.of("command", "reinstall-machine", "id", machineId(id)));
+    }
+
+    @PostMapping("/{id}/complete-installation")
+    public JsonNode completeInstallation(@PathVariable String id) throws IOException {
+        return gateway.command(Map.of("command", "complete-installation", "id", machineId(id)));
     }
 
     @PostMapping("/{id}/stop")

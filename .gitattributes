@@ -1,3 +1,4 @@
 *.sh text eol=lf
+release/automantle-qemu text eol=lf
 api/mvnw text eol=lf
 *.cmd text eol=crlf

@@ -1,0 +1,98 @@
+name: Release Linux x86_64
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential qemu-system-x86 qemu-system-gui
+          rustup toolchain install 1.93.1 --profile minimal
+          rustup default 1.93.1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: api/pom.xml
+
+      - name: Download pinned Cloud Hypervisor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-inputs
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output release-inputs/cloud-hypervisor-static \
+            https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/cloud-hypervisor-static
+          echo '448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc  release-inputs/cloud-hypervisor-static' | sha256sum --check --strict
+          chmod +x release-inputs/cloud-hypervisor-static
+
+      - name: Test source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path gateway/Cargo.toml
+          ./api/mvnw -f api/pom.xml test
+
+      - name: Build release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUTOMANTLE_JAVA_HOME="$JAVA_HOME" \
+          AUTOMANTLE_CLOUD_HYPERVISOR="$PWD/release-inputs/cloud-hypervisor-static" \
+            bash release/build-linux.sh
+
+      - name: Verify archive and write download checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=dist/automantle-linux-x86_64.tar.gz
+          [[ -s "$archive" ]]
+          [[ $(stat -c %s "$archive") -lt 2147483648 ]] || {
+            echo 'GitHub release assets must be smaller than 2 GiB' >&2
+            exit 1
+          }
+          mkdir -p release-check
+          tar -xzf "$archive" -C release-check
+          (
+            cd release-check/automantle-linux-x86_64
+            sha256sum --check SHA256SUMS
+            bin/cloud-hypervisor --version
+            bin/automantle-qemu --version
+            # TCG checks the packaged libraries and restricted network arguments without KVM or an OS.
+            status=0
+            timeout 2 bin/automantle-qemu -machine q35 -accel tcg -display none -S \
+              -nic 'user,restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:/bin/true' \
+              -monitor none || status=$?
+            [[ $status == 124 ]]
+            runtime/bin/java -version
+          )
+          (cd dist && sha256sum automantle-linux-x86_64.tar.gz > automantle-linux-x86_64.tar.gz.sha256)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/automantle-linux-x86_64.tar.gz \
+            dist/automantle-linux-x86_64.tar.gz.sha256 \
+            --verify-tag --generate-notes --title "AutoMantle $GITHUB_REF_NAME"
