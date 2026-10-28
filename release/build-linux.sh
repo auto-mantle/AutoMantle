@@ -12,7 +12,12 @@ done
 expected_cloud_hypervisor_sha256='448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc'
 read -r actual_cloud_hypervisor_sha256 _ < <(sha256sum "$AUTOMANTLE_CLOUD_HYPERVISOR")
 [[ $actual_cloud_hypervisor_sha256 == "$expected_cloud_hypervisor_sha256" ]] || { echo 'Cloud Hypervisor v53.0 checksum did not match the pinned static binary.' >&2; exit 1; }
-[[ $("$AUTOMANTLE_CLOUD_HYPERVISOR" --version) == 'cloud-hypervisor v53.0' ]] || { echo 'Cloud Hypervisor v53.0 is required.' >&2; exit 1; }
+cloud_hypervisor_version=$("$AUTOMANTLE_CLOUD_HYPERVISOR" --version)
+cloud_hypervisor_version_line=${cloud_hypervisor_version%%$'\n'*}
+[[ $cloud_hypervisor_version_line == 'cloud-hypervisor v53.0' ]] || {
+    printf 'Cloud Hypervisor v53.0 is required; received: %s\n' "$cloud_hypervisor_version" >&2
+    exit 1
+}
 "$AUTOMANTLE_JAVA_HOME/bin/java" -version 2>&1 | grep -q 'version "25' || { echo 'Java 25 is required.' >&2; exit 1; }
 
 cargo build --release --locked --manifest-path "$root/gateway/Cargo.toml"
