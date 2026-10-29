@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class VmGatewayService {
@@ -48,6 +49,7 @@ public class VmGatewayService {
     private final String socket;
     private final String binary;
     private final String terminal;
+    private final AtomicBoolean selectingIso = new AtomicBoolean();
 
     public VmGatewayService(
             @Value("${app.gateway.socket}") String socket,
@@ -66,6 +68,40 @@ public class VmGatewayService {
                         ? MACHINE_CREATION_TIMEOUT
                         : DEFAULT_TIMEOUT;
         return exchange(command, timeout);
+    }
+
+    public JsonNode selectIso() throws IOException {
+        if (!selectingIso.compareAndSet(false, true)) {
+            throw new IllegalArgumentException("The system file chooser is already open");
+        }
+        Process process = null;
+        try {
+            Path helper = Path.of(binary).toAbsolutePath().getParent().resolve("automantle-select-iso");
+            process = new ProcessBuilder(helper.toString())
+                    .redirectError(ProcessBuilder.Redirect.INHERIT).start();
+            if (!process.waitFor(5, TimeUnit.MINUTES)) {
+                throw new IllegalArgumentException("The system file chooser timed out");
+            }
+            if (process.exitValue() != 0) {
+                throw new IllegalArgumentException("Could not open the system file chooser. You can enter the ISO path directly.");
+            }
+            byte[] reply;
+            try (var input = process.getInputStream()) {
+                reply = input.readNBytes(65537);
+            }
+            if (reply.length > 65536) throw new IOException("Invalid file chooser response");
+            JsonNode result = mapper.readTree(new String(reply, StandardCharsets.UTF_8));
+            if (result == null || !result.has("path")) throw new IOException("Invalid file chooser response");
+            return result;
+        } catch (IOException error) {
+            throw new IllegalArgumentException("Could not open the system file chooser. You can enter the ISO path directly.", error);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IOException("File selection interrupted", error);
+        } finally {
+            if (process != null && process.isAlive()) process.destroyForcibly();
+            selectingIso.set(false);
+        }
     }
 
     JsonNode exchange(Map<String, ?> command, Duration timeout) throws IOException {

@@ -78,25 +78,14 @@ export async function vmsView(container, context) {
   }
   let allProfiles = [];
   const editor = node("div");
-  async function browseIso(input) {
-    const dialog = node("dialog", { className: "confirm-dialog iso-browser", "aria-label": "Select OS ISO" });
-    const listing = node("div", { className: "stack" }), location = node("p"), browseErrors = node("div");
-    const load = async directory => {
-      try {
-        const reply = await apiRequest("/vms/iso-files", jsonRequest("POST", { directory }));
-        location.textContent = reply.directory;
-        listing.replaceChildren(button("Parent directory", () => load(reply.parent)),
-          ...reply.entries.map(entry => button(`${entry.directory ? "Folder: " : ""}${entry.name}`, () => {
-            if (entry.directory) void load(entry.path);
-            else { input.value = entry.path; dialog.close(); }
-          })));
-        browseErrors.replaceChildren();
-      } catch (error) { notice(browseErrors, error); }
-    };
-    dialog.append(node("h3", {}, "Select OS ISO"), location, browseErrors, listing,
-      button("Cancel", () => dialog.close()));
-    dialog.addEventListener("close", () => dialog.remove(), { once: true });
-    document.body.append(dialog); dialog.showModal(); await load("");
+  async function browseIso(input, control) {
+    control.disabled = true;
+    try {
+      const reply = await apiRequest("/vms/select-iso", { method: "POST" });
+      errors.replaceChildren();
+      if (!disposed && typeof reply.path === "string") input.value = reply.path;
+    } catch (error) { notice(errors, error); }
+    finally { control.disabled = false; }
   }
   function settingsForm(vm = null) {
     const profiles = node("select", { name: "agentProfileId", required: true, className: "form-input" },
@@ -107,9 +96,10 @@ export async function vmsView(container, context) {
     const iso = field("OS installer ISO on this machine", "isoPath", "", {
       required: true, help: "Select an ISO you downloaded, or enter its full local path."
     });
+    const browse = button("Browse this machine", () => browseIso(iso.querySelector("input"), browse));
     return makeForm(vm ? "Edit VM" : "Create VM", [
       field("Name", "name", vm?.name ?? "", { required: true, maxlength: 80 }),
-      vm ? null : node("div", {}, iso, button("Browse this machine", () => browseIso(iso.querySelector("input")))),
+      vm ? null : node("div", {}, iso, browse),
       node("p", { className: "small muted" }, "AutoMantle creates the virtual disk. Your installed OS and files remain when this VM stops."),
       node("label", { className: "field" }, node("span", {}, "Agent Profile"), profiles),
       field("Memory (MiB)", "memoryMib", String(vm?.memoryMib ?? 2048), { type: "number", min: 128, max: 65536, required: true }),

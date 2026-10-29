@@ -8,18 +8,16 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class VmControllerTest {
-    @org.junit.jupiter.api.io.TempDir java.nio.file.Path files;
-    @Test void browsesLocalIsoPathsWithoutUploadingContents() throws Exception {
+    @Test void opensTheSystemFileChooser() throws Exception {
         var gateway = mock(VmGatewayService.class);
         var controller = new VmController(gateway);
-        java.nio.file.Files.createDirectory(files.resolve("downloads"));
-        java.nio.file.Files.writeString(files.resolve("ubuntu.iso"), "iso");
-        java.nio.file.Files.writeString(files.resolve("private.txt"), "hidden");
-        var result = controller.browse(new VmController.Browse(files.toString()));
-        var entries = (List<Map<String,Object>>) result.get("entries");
-        assertEquals(List.of("downloads", "ubuntu.iso"), entries.stream().map(e -> e.get("name")).toList());
-        assertEquals(files.resolve("ubuntu.iso").toRealPath().toString(), entries.get(1).get("path"));
-        verifyNoInteractions(gateway);
+        var mapper = tools.jackson.databind.json.JsonMapper.builder().build();
+        var selected = mapper.readTree("{\"path\":\"/home/user/Downloads/ubuntu.iso\"}");
+        var cancelled = mapper.readTree("{\"path\":null}");
+        when(gateway.selectIso()).thenReturn(selected, cancelled);
+        assertEquals(selected, controller.selectIso());
+        assertTrue(controller.selectIso().path("path").isNull());
+        verify(gateway, times(2)).selectIso();
     }
     private static final String RUN = "automantle-vm-" + "a".repeat(32);
     @Test void validatesTerminalBytesAndBindsWritesToOneRun() throws Exception {

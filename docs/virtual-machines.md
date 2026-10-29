@@ -10,7 +10,7 @@ Use the **Virtual Machines** tab to create, start, stop, copy, and delete VMs. A
 4. Select **Install OS**. Complete installation in the VM window on this machine. The installer exits when the guest reboots.
 5. Select **Installation finished — boot from disk**, then **Start** to use the installed OS.
 
-The application starts before any ISO is selected. The ISO stays at its original path and is never uploaded or modified. Keep it there until installation finishes. **Boot installer again** returns to that ISO. VM windows require a local graphical desktop and KVM.
+The application starts before any ISO is selected. **Browse this machine** opens the Linux desktop's system file chooser through XDG Desktop Portal. Cancelling leaves the path unchanged; the path can also be entered directly. The ISO stays at its original path and is never uploaded or modified. Keep it there until installation finishes. **Boot installer again** returns to that ISO. VM windows require a local graphical desktop and KVM.
 
 The VM's Linux files persist between clean dashboard runs. **Stop** asks the guest to shut down; **Force stop** is available if it does not. Unflushed guest writes can be lost on a forced stop. Copying creates an independent VM and disk. The gateway allows up to four concurrent runs. Run states and console tails are in gateway memory and are not a durable record of task success.
 

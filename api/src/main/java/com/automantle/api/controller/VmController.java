@@ -18,9 +18,6 @@ import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -48,27 +45,9 @@ public class VmController {
 
     public record Input(List<Integer> data) {}
 
-    public record Browse(String directory) {}
-
-    @PostMapping("/iso-files")
-    public Map<String, Object> browse(@RequestBody Browse request) throws IOException {
-        Path directory = Path.of(request.directory() == null || request.directory().isBlank()
-                ? System.getProperty("user.home") : request.directory()).toRealPath();
-        if (!Files.isDirectory(directory)) {
-            throw new IllegalArgumentException("Choose a directory on this machine");
-        }
-        try (var entries = Files.list(directory)) {
-            var files = entries.filter(path -> Files.isReadable(path)
-                            && (Files.isDirectory(path) || path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".iso")))
-                    .sorted(Comparator.<Path, Boolean>comparing(path -> !Files.isDirectory(path))
-                            .thenComparing(path -> path.getFileName().toString(), String.CASE_INSENSITIVE_ORDER))
-                    .limit(1000)
-                    .map(path -> Map.<String, Object>of("name", path.getFileName().toString(),
-                            "path", path.toString(), "directory", Files.isDirectory(path)))
-                    .toList();
-            return Map.of("directory", directory.toString(), "parent",
-                    directory.getParent() == null ? directory.toString() : directory.getParent().toString(), "entries", files);
-        }
+    @PostMapping("/select-iso")
+    public JsonNode selectIso() throws IOException {
+        return gateway.selectIso();
     }
 
     @GetMapping

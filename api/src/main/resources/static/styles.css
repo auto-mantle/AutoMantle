@@ -139,8 +139,6 @@ details > :not(summary) { margin-top: 12px; }
 .vm-terminal .xterm-viewport { overscroll-behavior: contain; scrollbar-width: auto; }
 .confirm-dialog { width: min(440px, calc(100% - 32px)); padding: 28px; border: 1px solid var(--ink); border-radius: 18px; background: var(--paper); color: var(--ink); box-shadow: 20px 24px 0 #262626, 0 35px 100px #0005; }
 .confirm-dialog::backdrop { background: #111a; }
-.iso-browser { max-height: 80vh; overflow-y: auto; overflow-wrap: anywhere; }
-.iso-browser .stack > button { text-align: left; }
 .confirm-dialog .actions { justify-content: flex-end; margin-top: 25px; }
 
 @media (max-width: 1000px) {

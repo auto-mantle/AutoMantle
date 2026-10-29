@@ -33,6 +33,7 @@ mkdir -p "$bundle/bin" "$bundle/app" "$bundle/runtime" "$bundle/share/guest"
 install -m 0755 "$root/gateway/target/release/automantle" "$bundle/bin/automantle"
 install -m 0755 "$root/gateway/target/release/automantle-gateway" "$bundle/bin/automantle-gateway"
 install -m 0755 "$root/gateway/target/release/automantle-proxy-stdio" "$bundle/bin/automantle-proxy-stdio"
+install -m 0755 "$root/gateway/target/release/automantle-select-iso" "$bundle/bin/automantle-select-iso"
 "$root/gateway/target/release/automantle-bundle-qemu" "$bundle/qemu"
 install -m 0755 "$root/release/automantle-qemu" "$bundle/bin/automantle-qemu"
 "$bundle/bin/automantle-qemu" --version

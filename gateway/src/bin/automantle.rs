@@ -220,7 +220,20 @@ mod linux {
                     application_data.to_string_lossy().into_owned(),
                 ),
                 ("PORT".into(), port.to_string()),
-            ],
+            ]
+            .into_iter()
+            .chain(
+                [
+                    "DISPLAY",
+                    "WAYLAND_DISPLAY",
+                    "XAUTHORITY",
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "XDG_RUNTIME_DIR",
+                ]
+                .into_iter()
+                .filter_map(|key| env::var(key).ok().map(|value| (key.to_owned(), value))),
+            )
+            .collect::<Vec<_>>(),
         )?;
         let result = (|| -> Result<()> {
             wait_for(|| api_ready(port), API_UNIT)?;
