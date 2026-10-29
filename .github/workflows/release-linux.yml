@@ -24,7 +24,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential qemu-system-x86 qemu-system-gui
+          sudo apt-get install -y build-essential qemu-system-x86 qemu-system-gui xvfb xauth
           rustup toolchain install 1.93.1 --profile minimal
           rustup default 1.93.1
 
@@ -84,6 +84,16 @@ jobs:
               -nic 'user,restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:/bin/true' \
               -monitor none || status=$?
             [[ $status == 124 ]]
+            # Exercise the GTK installer window, including firmware loading and GIO initialization.
+            status=0
+            GIO_EXTRA_MODULES=/usr/lib/x86_64-linux-gnu/gio/modules \
+              xvfb-run -a timeout 3 bin/automantle-qemu -machine q35 -accel tcg -display gtk -S \
+                -nic none -monitor none 2>qemu-gtk-check.log || status=$?
+            cat qemu-gtk-check.log
+            [[ $status == 124 ]]
+            if grep -E 'undefined symbol|Failed to load module|could not load PC BIOS' qemu-gtk-check.log; then
+              exit 1
+            fi
             runtime/bin/java -version
           )
           (cd dist && sha256sum automantle-linux-x86_64.tar.gz > automantle-linux-x86_64.tar.gz.sha256)

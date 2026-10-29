@@ -69,6 +69,19 @@ fn library_dependencies(source: &Path) -> Result<Vec<PathBuf>> {
     dependencies(&stdout)
 }
 
+fn copy_firmware(qemu_data: &Path, seabios: &Path, destination: &Path) -> Result<()> {
+    let mut active = BTreeSet::new();
+    copy_tree(qemu_data, destination, &mut active)?;
+    // QEMU's -L option searches one directory. Ubuntu installs SeaBIOS separately.
+    copy_tree(seabios, destination, &mut active)?;
+    for required in ["bios-256k.bin", "vgabios-stdvga.bin"] {
+        if !destination.join(required).is_file() {
+            return Err(format!("required QEMU firmware is missing: {required}").into());
+        }
+    }
+    Ok(())
+}
+
 fn bundle(destination: &Path) -> Result<()> {
     if env::consts::OS != "linux" || env::consts::ARCH != "x86_64" {
         return Err("QEMU releases must be assembled on Linux x86_64".into());
@@ -80,22 +93,17 @@ fn bundle(destination: &Path) -> Result<()> {
     fs::create_dir(destination)?;
     fs::create_dir(destination.join("bin"))?;
     fs::create_dir(destination.join("lib"))?;
+    // Use GLib's built-in local filesystem support, without loading host GVfs plugins.
+    fs::create_dir(destination.join("gio-modules"))?;
     fs::copy(&binary, destination.join("bin/qemu-system-x86_64"))?;
     let modules = Path::new("/usr/lib/x86_64-linux-gnu/qemu");
     let mut active = BTreeSet::new();
     copy_tree(modules, &destination.join("modules"), &mut active)?;
-    copy_tree(
+    copy_firmware(
         Path::new("/usr/share/qemu"),
+        Path::new("/usr/share/seabios"),
         &destination.join("share/qemu"),
-        &mut active,
     )?;
-    if Path::new("/usr/share/seabios").is_dir() {
-        copy_tree(
-            Path::new("/usr/share/seabios"),
-            &destination.join("share/seabios"),
-            &mut active,
-        )?;
-    }
     let mut queue = vec![binary];
     for entry in fs::read_dir(modules)? {
         let path = entry?.path();
@@ -190,6 +198,64 @@ mod tests {
         );
         symlink(".", source.join("cycle")).unwrap();
         assert!(copy_tree(&source, &base.join("cycle-copy"), &mut BTreeSet::new()).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn firmware_is_collected_in_the_directory_qemu_actually_searches() {
+        let base = env::temp_dir().join(format!("automantle-firmware-test-{}", std::process::id()));
+        let qemu = base.join("qemu");
+        let seabios = base.join("seabios");
+        fs::create_dir_all(&qemu).unwrap();
+        fs::create_dir(&seabios).unwrap();
+        fs::write(qemu.join("keymap"), b"map").unwrap();
+        fs::write(seabios.join("bios-256k.bin"), b"bios").unwrap();
+        fs::write(seabios.join("vgabios-stdvga.bin"), b"vga").unwrap();
+        let output = base.join("bundle/share/qemu");
+        copy_firmware(&qemu, &seabios, &output).unwrap();
+        assert_eq!(fs::read(output.join("bios-256k.bin")).unwrap(), b"bios");
+        assert_eq!(fs::read(output.join("vgabios-stdvga.bin")).unwrap(), b"vga");
+        assert!(output.join("keymap").is_file());
+        fs::remove_file(seabios.join("bios-256k.bin")).unwrap();
+        assert!(copy_firmware(&qemu, &seabios, &base.join("incomplete")).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_uses_bundled_firmware_and_excludes_host_gio_modules() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = env::temp_dir().join(format!("automantle qemu launcher {}", std::process::id()));
+        fs::create_dir_all(base.join("bin")).unwrap();
+        fs::create_dir_all(base.join("qemu/lib")).unwrap();
+        let launcher = base.join("bin/automantle-qemu");
+        fs::write(&launcher, include_str!("automantle-qemu")).unwrap();
+        let loader = base.join("qemu/lib/ld-linux-x86-64.so.2");
+        fs::write(&loader, "#!/usr/bin/env bash\nprintf '%s\\n' \"$GIO_MODULE_DIR\" \"${GIO_EXTRA_MODULES-unset}\" \"$GIO_USE_VFS\" \"$GSETTINGS_BACKEND\" \"$@\"\n").unwrap();
+        fs::set_permissions(&loader, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new("bash")
+            .arg(&launcher)
+            .arg("--version")
+            .env("GIO_MODULE_DIR", "/host/modules")
+            .env("GIO_EXTRA_MODULES", "/host/extra-modules")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], base.join("qemu/gio-modules").to_str().unwrap());
+        assert_eq!(&lines[1..4], &["unset", "local", "memory"]);
+        let bios = base.join("qemu/share/qemu/bios-256k.bin");
+        assert!(
+            lines
+                .windows(2)
+                .any(|pair| pair == ["-bios", bios.to_str().unwrap()])
+        );
+        assert_eq!(lines.last(), Some(&"--version"));
         fs::remove_dir_all(base).unwrap();
     }
 }
