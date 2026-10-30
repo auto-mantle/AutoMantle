@@ -10,9 +10,12 @@ use crate::{
 };
 use std::{
     env,
-    fs::{self, File},
-    io::{Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        net::UnixStream,
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -24,6 +27,24 @@ use std::{
 };
 
 const PROXY_ADDRESS: &str = "10.0.2.100:3128";
+
+fn qmp_ready(path: &Path) -> Result<()> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+    read_qmp_greeting(stream)
+}
+
+fn read_qmp_greeting(stream: UnixStream) -> Result<()> {
+    let mut greeting = String::new();
+    BufReader::new(stream)
+        .take(65536)
+        .read_line(&mut greeting)?;
+    let value: serde_json::Value = serde_json::from_str(&greeting)?;
+    if !value.get("QMP").is_some_and(serde_json::Value::is_object) {
+        return Err("QEMU did not send a QMP greeting".into());
+    }
+    Ok(())
+}
 
 pub fn run(
     machine: Machine,
@@ -103,6 +124,7 @@ pub fn run(
                 "--collect",
                 "--pipe",
                 "--service-type=exec",
+                "--expand-environment=no",
                 "--unit",
                 &id,
             ])
@@ -168,10 +190,22 @@ pub fn run(
         } else {
             command.args(["-boot", "order=c"]);
         }
-        let error_log = runtime.join("qemu-stderr.log");
-        command.stderr(File::create(&error_log)?);
+        // Keep startup diagnostics with the saved VM, outside the disposable runtime directory.
+        let error_log = disk
+            .parent()
+            .ok_or("invalid VM disk path")?
+            .join("qemu.log");
+        let log = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&error_log)?;
+        command.stdout(log.try_clone()?).stderr(log);
         let mut child = command.spawn()?;
-        event(RunEvent::State("running"));
+        let startup_deadline = Instant::now() + Duration::from_secs(30);
+        let mut ready = false;
         let result = loop {
             if cancelled.load(Ordering::Relaxed) {
                 let _ = rootless::stop_vmm(&id);
@@ -187,11 +221,34 @@ pub fn run(
                 Err(error) => break Err(error.into()),
             };
             if let Some(status) = status {
-                if status.success() {
+                if status.success() && ready {
                     break Ok(());
                 }
                 let detail = fs::read_to_string(&error_log).unwrap_or_default();
-                break Err(format!("QEMU exited ({status}): {}", detail.trim()).into());
+                break Err(format!(
+                    "QEMU exited ({status}): {}. Log: {}",
+                    detail.trim(),
+                    error_log.display()
+                )
+                .into());
+            }
+            if !ready {
+                match qmp_ready(&qmp) {
+                    Ok(()) => {
+                        ready = true;
+                        event(RunEvent::State("running"));
+                    }
+                    Err(error) if Instant::now() >= startup_deadline => {
+                        let detail = fs::read_to_string(&error_log).unwrap_or_default();
+                        break Err(format!(
+                            "QEMU did not become ready within 30 seconds: {error}; {}. Log: {}",
+                            detail.trim(),
+                            error_log.display()
+                        )
+                        .into());
+                    }
+                    Err(_) => (),
+                }
             }
             thread::sleep(Duration::from_millis(100));
         };
@@ -202,6 +259,9 @@ pub fn run(
         }
         result
     })();
+    if let Err(error) = &result {
+        eprintln!("run={id} QEMU launch/run failed: {error}");
+    }
     if let Err(error) = rootless::destroy_run(&id) {
         eprintln!("run={id} cleanup failed: {error}");
     }
@@ -219,4 +279,40 @@ pub fn request_shutdown(id: &str) -> Result<()> {
     let _ = stream.read(&mut greeting)?;
     stream.write_all(b"{\"execute\":\"system_powerdown\"}\n")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_requires_a_qmp_greeting() {
+        for (greeting, expected) in [
+            ("{\"QMP\":{\"version\":{},\"capabilities\":[]}}\r\n", true),
+            ("{\"return\":{}}\n", false),
+            ("{\"QMP\":null}\n", false),
+            ("not JSON\n", false),
+            ("", false),
+        ] {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(greeting.as_bytes()).unwrap();
+            drop(writer);
+            assert_eq!(read_qmp_greeting(reader).is_ok(), expected, "{greeting}");
+        }
+    }
+
+    #[test]
+    fn readiness_accepts_a_fragmented_greeting() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sender = thread::spawn(move || {
+            writer.write_all(b"{\"QMP\":").unwrap();
+            thread::sleep(Duration::from_millis(10));
+            writer.write_all(b"{}}\r\n").unwrap();
+        });
+        read_qmp_greeting(reader).unwrap();
+        sender.join().unwrap();
+    }
 }

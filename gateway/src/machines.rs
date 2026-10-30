@@ -63,6 +63,11 @@ mod tests {
         let updated = store.update_machine(&vm.id, settings).unwrap();
         assert!(updated.install_complete);
         assert_eq!(updated.iso_path, vm.iso_path);
+        fs::write(
+            store.disk(&vm.id).unwrap().join("qemu.log"),
+            b"startup error",
+        )
+        .unwrap();
         store.delete_machine(&vm.id).unwrap();
         fs::remove_dir(base.join("vms")).unwrap();
         fs::remove_file(source).unwrap();
@@ -277,7 +282,10 @@ impl Store {
         let directory = self.disk(id)?;
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
-            if !matches!(entry.file_name().to_str(), Some("rootfs" | "machine.json")) {
+            if !matches!(
+                entry.file_name().to_str(),
+                Some("rootfs" | "machine.json" | "qemu.log")
+            ) {
                 return Err("VM environment has unfinished host artifacts; inspect gateway logs before deleting".into());
             }
         }
@@ -286,6 +294,11 @@ impl Store {
         File::open(&self.directory)?.sync_all()?;
         fs::remove_file(deleted.join("rootfs"))?;
         fs::remove_file(deleted.join("machine.json"))?;
+        match fs::remove_file(deleted.join("qemu.log")) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
         fs::remove_dir(&deleted)?;
         File::open(&self.directory)?.sync_all()?;
         Ok(())

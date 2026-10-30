@@ -12,6 +12,8 @@ journalctl --user -u automantle-api.service -u automantle-gateway.service -n 100
 
 Start with `automantle up` and stop with `automantle down`. The gateway control socket is `$XDG_RUNTIME_DIR/automantle/control.sock`. VM units have names beginning with `automantle-vm-`; `down` stops any that remain after gateway shutdown.
 
+For **Install OS** and other ISO VM launches, QEMU output is saved as `qemu.log` beside that VM's `rootfs` disk. The error shown in the dashboard includes the log path. The log survives runtime cleanup and is replaced on the next launch of that VM; copy it before retrying if you need to keep it. Launch failures are also written to the gateway journal. A VM stays in `preparing` until QEMU answers on its control socket.
+
 ## Data and backups
 
 The API SQLite database, saved VM images, managed credentials, and optional inspection CA live under `$XDG_DATA_HOME/automantle/` or `~/.local/share/automantle/`. Stop AutoMantle before copying this directory for a consistent backup. Preserve ownership and file modes. Back up the SQLite directory with any WAL files. Protect credentials and the CA private key.
