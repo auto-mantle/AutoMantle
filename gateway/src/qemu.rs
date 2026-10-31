@@ -49,7 +49,6 @@ fn read_qmp_greeting(stream: UnixStream) -> Result<()> {
 pub fn run(
     machine: Machine,
     disk: PathBuf,
-    install: bool,
     backend: Backend,
     credentials_path: PathBuf,
     tls_path: PathBuf,
@@ -58,10 +57,6 @@ pub fn run(
     event: EventSink,
 ) -> Result<()> {
     backend.validate_profile(&machine.settings.agent_profile_id)?;
-    let iso = machine.iso_path.as_ref().ok_or("VM has no installer ISO")?;
-    if install && !Path::new(iso).is_file() {
-        return Err("The selected ISO file is no longer available on this machine".into());
-    }
     let qemu = env::var_os("AUTOMANTLE_QEMU_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -73,16 +68,13 @@ pub fn run(
                 .unwrap_or_else(|| PathBuf::from("/usr/bin/qemu-system-x86_64"))
         });
     if !qemu.is_absolute() || !qemu.is_file() {
-        return Err(
-            "QEMU is required to install and run an OS from an ISO (qemu-system-x86_64)".into(),
-        );
-    }
-    if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
-        return Err("A desktop display is needed to show the OS installer and VM window".into());
+        return Err("QEMU is required to run managed environments (qemu-system-x86_64)".into());
     }
     let (runtime, _temporary_disks) = rootless::create_run(&id)?;
     let result = (|| -> Result<()> {
         event(RunEvent::State("preparing"));
+        let seed = crate::managed::seed(&runtime, &machine.id, &tls_path)?;
+        let serial_path = runtime.join("serial.sock");
         let gateway = env::current_exe()?;
         let helper = gateway
             .parent()
@@ -148,17 +140,6 @@ pub fn run(
                 "--setenv=AUTOMANTLE_PROXY_SOCKET={}",
                 proxy_socket.display()
             ));
-        for key in [
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "XAUTHORITY",
-            "DBUS_SESSION_BUS_ADDRESS",
-            "XDG_RUNTIME_DIR",
-        ] {
-            if let Ok(value) = env::var(key) {
-                command.arg(format!("--setenv={key}={value}"));
-            }
-        }
         command.arg("--").arg(qemu);
         command.current_dir(disk.parent().ok_or("invalid VM disk path")?);
         command
@@ -176,22 +157,25 @@ pub fn run(
                 )
                 .replace(',', ",,")
             ))
-            // Boot from the ISO or disk; do not require an external PXE option ROM.
-            .args(["-device", "e1000e,netdev=proxy,romfile="])
+            // Boot the managed disk without an external PXE option ROM.
+            .args([
+                "-device",
+                "e1000e,netdev=proxy,mac=52:54:00:12:34:56,romfile=",
+            ])
             .arg("-qmp")
             .arg(format!("unix:{},server=on,wait=off", qmp.display()))
-            .args(["-display", "gtk", "-vga", "std", "-monitor", "none"])
+            .args(["-display", "none", "-vga", "none", "-monitor", "none"])
+            .arg("-serial")
+            .arg(format!("unix:{},server=on,wait=off", serial_path.display()))
+            .arg("-drive")
+            .arg(format!(
+                "file={},format=raw,if=virtio,readonly=on",
+                seed.to_string_lossy().replace(',', ",,")
+            ))
             .env("AUTOMANTLE_PROXY_SOCKET", &proxy_socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null());
-        if install {
-            command
-                .arg("-cdrom")
-                .arg(iso)
-                .args(["-boot", "order=d", "-no-reboot"]);
-        } else {
-            command.args(["-boot", "order=c"]);
-        }
+        command.args(["-boot", "order=c"]);
         // Keep startup diagnostics with the saved VM, outside the disposable runtime directory.
         let error_log = disk
             .parent()
@@ -208,6 +192,10 @@ pub fn run(
         let mut child = command.spawn()?;
         let startup_deadline = Instant::now() + Duration::from_secs(30);
         let mut ready = false;
+        let mut serial: Option<UnixStream> = None;
+        let mut guest_ready = false;
+        let guest_deadline = Instant::now() + Duration::from_secs(300);
+        let mut tail = Vec::new();
         let result = loop {
             if cancelled.load(Ordering::Relaxed) {
                 let _ = rootless::stop_vmm(&id);
@@ -223,7 +211,7 @@ pub fn run(
                 Err(error) => break Err(error.into()),
             };
             if let Some(status) = status {
-                if status.success() && ready {
+                if status.success() && guest_ready {
                     break Ok(());
                 }
                 let detail = fs::read_to_string(&error_log).unwrap_or_default();
@@ -238,7 +226,6 @@ pub fn run(
                 match qmp_ready(&qmp) {
                     Ok(()) => {
                         ready = true;
-                        event(RunEvent::State("running"));
                     }
                     Err(error) if Instant::now() >= startup_deadline => {
                         let detail = fs::read_to_string(&error_log).unwrap_or_default();
@@ -251,6 +238,52 @@ pub fn run(
                     }
                     Err(_) => (),
                 }
+            }
+            if ready && serial.is_none() {
+                if let Ok(stream) = UnixStream::connect(&serial_path) {
+                    if let Err(error) = stream.set_nonblocking(true) {
+                        break Err(error.into());
+                    }
+                    serial = Some(stream);
+                }
+            }
+            if let Some(stream) = serial.as_mut() {
+                let mut bytes = [0u8; 8192];
+                match stream.read(&mut bytes) {
+                    Ok(0) if guest_ready => serial = None,
+                    Ok(0) => break Err("Guest serial console closed".into()),
+                    Ok(count) => {
+                        event(RunEvent::Console(bytes[..count].to_vec()));
+                        if !guest_ready {
+                            tail.extend_from_slice(&bytes[..count]);
+                            if tail
+                                .windows(crate::managed::READY.len())
+                                .any(|part| part == crate::managed::READY)
+                            {
+                                guest_ready = true;
+                                let terminal = match stream.try_clone() {
+                                    Ok(terminal) => terminal,
+                                    Err(error) => break Err(error.into()),
+                                };
+                                event(RunEvent::Terminal(terminal));
+                                event(RunEvent::State("running"));
+                            }
+                            if tail.len() > 1024 {
+                                tail.drain(..tail.len() - 1024);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(error)
+                        if guest_ready && error.kind() == std::io::ErrorKind::ConnectionReset =>
+                    {
+                        serial = None
+                    }
+                    Err(error) => break Err(error.into()),
+                }
+            }
+            if !guest_ready && Instant::now() >= guest_deadline {
+                break Err("Guest setup did not finish within five minutes; inspect the environment console output".into());
             }
             thread::sleep(Duration::from_millis(100));
         };

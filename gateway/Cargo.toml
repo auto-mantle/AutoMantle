@@ -9,8 +9,6 @@ autobins = false
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.11.1", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
@@ -45,7 +43,3 @@ path = "src/bin/automantle-proxy-stdio.rs"
 [[bin]]
 name = "automantle-bundle-qemu"
 path = "../release/bundle-qemu.rs"
-
-[[bin]]
-name = "automantle-select-iso"
-path = "src/bin/automantle-select-iso.rs"

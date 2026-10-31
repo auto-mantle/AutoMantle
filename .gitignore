@@ -1,4 +1,6 @@
 target/
+__pycache__/
+*.pyc
 out/
 .m2/
 **/.cargo/registry/

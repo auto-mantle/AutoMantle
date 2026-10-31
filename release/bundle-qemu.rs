@@ -104,7 +104,9 @@ fn bundle(destination: &Path) -> Result<()> {
         Path::new("/usr/share/seabios"),
         &destination.join("share/qemu"),
     )?;
-    let mut queue = vec![binary];
+    let seed_tool = PathBuf::from("/usr/bin/genisoimage");
+    fs::copy(&seed_tool, destination.join("bin/genisoimage"))?;
+    let mut queue = vec![binary, seed_tool];
     for entry in fs::read_dir(modules)? {
         let path = entry?.path();
         if path.extension().is_some_and(|extension| extension == "so") {

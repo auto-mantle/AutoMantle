@@ -24,7 +24,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential qemu-system-x86 qemu-system-gui xvfb xauth
+          sudo apt-get install -y build-essential qemu-system-x86 qemu-utils genisoimage
           rustup toolchain install 1.93.1 --profile minimal
           rustup default 1.93.1
 
@@ -80,18 +80,12 @@ jobs:
             bin/automantle-qemu --version
             # Check the missing-ROM failure and the gateway's explicit ROM-free NIC.
             bash ../../release/check-qemu-network.sh bin/automantle-qemu
-            # Exercise the GTK installer window, including firmware loading and GIO initialization.
-            status=0
-            GIO_EXTRA_MODULES=/usr/lib/x86_64-linux-gnu/gio/modules \
-              xvfb-run -a timeout 3 bin/automantle-qemu -machine q35 -accel tcg -display gtk -S \
-                -netdev 'user,id=proxy,restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:/bin/true' \
-                -device 'e1000e,netdev=proxy,romfile=' \
-                -monitor none 2>qemu-gtk-check.log || status=$?
-            cat qemu-gtk-check.log
-            [[ $status == 124 ]]
-            if grep -E 'undefined symbol|Failed to load module|could not load PC BIOS' qemu-gtk-check.log; then
-              exit 1
-            fi
+            # Boot the packaged managed guest twice, including automatic terminal login.
+            AUTOMANTLE_TEST_IMAGE="$PWD/share/guest/ubuntu.raw" \
+            AUTOMANTLE_TEST_SEED_TOOL="$PWD/bin/automantle-seed" \
+            AUTOMANTLE_TEST_QEMU="$PWD/bin/automantle-qemu" \
+              cargo test --locked --manifest-path ../../gateway/Cargo.toml \
+                managed::tests::boots_managed_guest_without_an_installer -- --ignored --nocapture
             runtime/bin/java -version
           )
           (cd dist && sha256sum automantle-linux-x86_64.tar.gz > automantle-linux-x86_64.tar.gz.sha256)

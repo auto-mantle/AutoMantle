@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+exec "$root/qemu/lib/ld-linux-x86-64.so.2" --library-path "$root/qemu/lib" \
+    "$root/qemu/bin/genisoimage" "$@"

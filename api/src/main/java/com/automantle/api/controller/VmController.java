@@ -26,7 +26,7 @@ import java.util.UUID;
 @RequestMapping("/vms")
 public class VmController {
     private static final int MAX_NAME_LENGTH = 80;
-    private static final int MIN_MEMORY_MIB = 128;
+    private static final int MIN_MEMORY_MIB = 1024;
     private static final int MAX_MEMORY_MIB = 65_536;
     private static final int MAX_VCPU_COUNT = 64;
     private static final int MAX_TERMINAL_INPUT_BYTES = 4096;
@@ -38,17 +38,11 @@ public class VmController {
     }
 
     public record Settings(
-            String name, UUID agentProfileId, int memoryMib, int vcpuCount, boolean setup,
-            String isoPath) {}
+            String name, UUID agentProfileId, int memoryMib, int vcpuCount, boolean setup) {}
 
     public record CopyVm(String name) {}
 
     public record Input(List<Integer> data) {}
-
-    @PostMapping("/select-iso")
-    public JsonNode selectIso() throws IOException {
-        return gateway.selectIso();
-    }
 
     @GetMapping
     public JsonNode list() throws IOException {
@@ -57,14 +51,7 @@ public class VmController {
 
     @PostMapping
     public JsonNode create(@RequestBody Settings request) throws IOException {
-        if (request.isoPath() == null || request.isoPath().isBlank()) {
-            throw new IllegalArgumentException("Select a local OS ISO file for this VM");
-        }
-        return gateway.command(
-                Map.of(
-                        "command", "create-machine",
-                        "settings", settings(request),
-                        "isoPath", request.isoPath().trim()));
+        return gateway.command(Map.of("command", "create-machine", "settings", settings(request)));
     }
 
     @PutMapping("/{id}")
@@ -101,16 +88,6 @@ public class VmController {
     @PostMapping("/{id}/start")
     public JsonNode start(@PathVariable String id) throws IOException {
         return gateway.command(Map.of("command", "start-machine", "id", machineId(id)));
-    }
-
-    @PostMapping("/{id}/reinstall")
-    public JsonNode reinstall(@PathVariable String id) throws IOException {
-        return gateway.command(Map.of("command", "reinstall-machine", "id", machineId(id)));
-    }
-
-    @PostMapping("/{id}/complete-installation")
-    public JsonNode completeInstallation(@PathVariable String id) throws IOException {
-        return gateway.command(Map.of("command", "complete-installation", "id", machineId(id)));
     }
 
     @PostMapping("/{id}/stop")

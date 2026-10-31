@@ -10,7 +10,7 @@ Local browser -> API/dashboard -> profiles, rules, approvals, history in SQLite
              restricted guest network -> workload in a VM
 ```
 
-The API manages policy and the dashboard. Each VM belongs to one agent profile, and the gateway asks the API to evaluate requests against it. The CLI starts the API and gateway as user services. ISO VMs run as QEMU user services; advanced direct kernel launches use Cloud Hypervisor. No AutoMantle host process runs as root.
+The API manages policy and the dashboard. Each VM belongs to one agent profile, and the gateway asks the API to evaluate requests against it. The CLI starts the API and gateway as user services. Managed environments run as QEMU user services; advanced direct kernel launches use Cloud Hypervisor. No AutoMantle host process runs as root.
 
 ## Request decisions
 
@@ -18,7 +18,7 @@ For an HTTP action, a rule matches its method, exact host, and path. A matching 
 
 ## Guest and host boundaries
 
-ISO VMs use a restricted QEMU user network with an explicit forward from `10.0.2.100:3128` to that VM's private host policy proxy. Direct traffic to the host and internet is disabled. Advanced Cloud Hypervisor launches retain their guest VSOCK bridge. The gateway's control socket and storage belong to the login account. QEMU runs as a systemd user service with memory and CPU limits.
+Managed environments use a restricted QEMU user network with an explicit forward from `10.0.2.100:3128` to that VM's private host policy proxy. Direct traffic to the host and internet is disabled. Advanced Cloud Hypervisor launches retain their guest VSOCK bridge. The gateway's control socket and storage belong to the login account. QEMU runs as a systemd user service with memory and CPU limits.
 
 The proxy supports HTTP and, after CA preparation, inspected HTTPS. It blocks private and special-use upstream destinations and IPv6-only destinations. Request History records decisions seen by the proxy. Traffic that cannot reach the proxy is not represented as a packet count in new rootless VM runs.
 

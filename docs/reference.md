@@ -30,11 +30,13 @@ The API listens on `127.0.0.1`. Its gateway socket is supplied by the CLI. Brows
 
 ## Building a release
 
-Maintainers build on Ubuntu 24.04 x86_64 with Rust 1.88+, a JDK 25, Maven wrapper dependencies, `cc`, `ldd`, and the `qemu-system-x86` and `qemu-system-gui` packages. Set `AUTOMANTLE_JAVA_HOME` and `AUTOMANTLE_CLOUD_HYPERVISOR`, then run `bash release/build-linux.sh`. The Rust packaging helper bundles QEMU, its modules, firmware, and shared libraries. It packages the compiled components under `dist/automantle-linux-x86_64.tar.gz` and records checksums. The archive contains no guest operating system. Source-checkout users can use system QEMU or set `AUTOMANTLE_QEMU_BINARY` when starting the gateway.
+Maintainers build on Ubuntu 24.04 x86_64 with Rust 1.88+, a JDK 25, Maven wrapper dependencies, `cc`, `ldd`, and the `qemu-system-x86`, `qemu-utils`, and `genisoimage` packages. Set `AUTOMANTLE_JAVA_HOME` and `AUTOMANTLE_CLOUD_HYPERVISOR`, then run `bash release/build-linux.sh`. The Rust packaging helper bundles QEMU, its modules, firmware, and shared libraries. It packages the compiled components under `dist/automantle-linux-x86_64.tar.gz` and records checksums. The archive includes the pinned Ubuntu image, converted to a sparse raw disk, and the seed-image generator. Source-checkout users can use system QEMU or set `AUTOMANTLE_QEMU_BINARY` when starting the gateway.
 
 ### Publish through GitHub Actions
 
-The [Linux release workflow](../.github/workflows/release-linux.yml) runs when a `v*` tag is pushed. It downloads the pinned Cloud Hypervisor v53.0 binary, builds and tests the Rust and Java code, packages a Java 25 runtime, checks the archive, and publishes the archive and its `.sha256` file as GitHub Release assets. No guest OS URL or hash is needed. Release users do not need a host Java or Rust installation.
+The managed UI requires the release layout, including `share/guest/ubuntu.raw` and `bin/automantle-seed`. Selecting a system QEMU binary alone does not supply those assets. The image and seed tool are bundled so users do not install guest provisioning tools on the host.
+
+The [Linux release workflow](../.github/workflows/release-linux.yml) runs when a `v*` tag is pushed. It downloads the pinned Cloud Hypervisor v53.0 binary, builds and tests the Rust and Java code, packages a Java 25 runtime, checks the archive, and publishes the archive and its `.sha256` file as GitHub Release assets. The guest URL and SHA-256 are pinned in `release/guest-image.env`. Update them together with `IMAGE_VERSION` in `gateway/src/managed.rs` and run the managed guest boot test before publishing. Release users do not need a host Java or Rust installation.
 
 After the desired commit is ready, create and push a version tag, for example:
 

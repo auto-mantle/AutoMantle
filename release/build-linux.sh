@@ -5,7 +5,7 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 : "${AUTOMANTLE_JAVA_HOME:?set AUTOMANTLE_JAVA_HOME to a Linux JDK 25 directory}"
 : "${AUTOMANTLE_CLOUD_HYPERVISOR:?set AUTOMANTLE_CLOUD_HYPERVISOR to the pinned v53.0 static binary}"
-for tool in cargo cc sha256sum tar ldd qemu-system-x86_64; do
+for tool in cargo cc sha256sum tar ldd qemu-system-x86_64 qemu-img genisoimage curl; do
     command -v "$tool" >/dev/null || { echo "Missing release build tool: $tool" >&2; exit 1; }
 done
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { echo 'Build on Linux x86_64.' >&2; exit 1; }
@@ -33,11 +33,13 @@ mkdir -p "$bundle/bin" "$bundle/app" "$bundle/runtime" "$bundle/share/guest"
 install -m 0755 "$root/gateway/target/release/automantle" "$bundle/bin/automantle"
 install -m 0755 "$root/gateway/target/release/automantle-gateway" "$bundle/bin/automantle-gateway"
 install -m 0755 "$root/gateway/target/release/automantle-proxy-stdio" "$bundle/bin/automantle-proxy-stdio"
-install -m 0755 "$root/gateway/target/release/automantle-select-iso" "$bundle/bin/automantle-select-iso"
 "$root/gateway/target/release/automantle-bundle-qemu" "$bundle/qemu"
 install -m 0755 "$root/release/automantle-qemu" "$bundle/bin/automantle-qemu"
+install -m 0755 "$root/release/automantle-seed" "$bundle/bin/automantle-seed"
 "$bundle/bin/automantle-qemu" --version
-"$bundle/bin/automantle-qemu" -display help | grep -q gtk
+bash "$root/release/fetch-guest.sh" "$stage/ubuntu.img"
+qemu-img convert -f qcow2 -O raw "$stage/ubuntu.img" "$bundle/share/guest/ubuntu.raw"
+install -m 0644 "$root/release/guest-image.env" "$bundle/share/guest/image-source.txt"
 install -m 0755 "$AUTOMANTLE_CLOUD_HYPERVISOR" "$bundle/bin/cloud-hypervisor"
 cp -a "$AUTOMANTLE_JAVA_HOME"/. "$bundle/runtime"/
 install -m 0644 "$jar" "$bundle/app/api.jar"
@@ -52,5 +54,5 @@ install -m 0644 "$root/gateway/guest/automantle-vsock-proxy.service" "$bundle/sh
 )
 archive="$root/dist/automantle-linux-x86_64.tar.gz"
 [[ ! -e $archive ]] || { echo "Output already exists: $archive" >&2; exit 1; }
-tar -C "$stage" -czf "$archive" automantle-linux-x86_64
+tar --sparse -C "$stage" -czf "$archive" automantle-linux-x86_64
 printf 'Built %s\n' "$archive"

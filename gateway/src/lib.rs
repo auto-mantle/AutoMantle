@@ -31,3 +31,6 @@ pub mod tls;
 pub mod transport;
 #[cfg(target_os = "linux")]
 pub mod vsock;
+
+#[cfg(target_os = "linux")]
+pub mod managed;

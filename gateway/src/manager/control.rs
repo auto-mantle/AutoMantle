@@ -166,7 +166,6 @@ pub fn cli(args: &[String]) -> Result<()> {
                 "--default-kernel",
                 "--default-rootfs",
                 "--tls-ca-config",
-                "--credentials-config",
             ],
         )?;
         let config = PathBuf::from(
@@ -183,6 +182,9 @@ pub fn cli(args: &[String]) -> Result<()> {
         let (listener, _guard) = bind(&socket)?;
         let backend = Backend::load(&config)?;
         let defaults = Defaults::load()?;
+        if !values.contains_key("--tls-ca-config") && !defaults.tls.exists() {
+            crate::tls::initialize(defaults.tls.parent().ok_or("invalid TLS directory")?)?;
+        }
         let default_disk_directory = crate::rootless::data_parent()?
             .parent()
             .ok_or("invalid data directory")?
@@ -210,7 +212,6 @@ pub fn cli(args: &[String]) -> Result<()> {
                     .get("--tls-ca-config")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| defaults.tls),
-                credentials: values.get("--credentials-config").map(PathBuf::from),
             },
             machine_runs: BTreeMap::new(),
             tasks: BTreeMap::new(),

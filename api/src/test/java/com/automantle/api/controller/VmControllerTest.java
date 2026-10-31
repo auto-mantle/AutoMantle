@@ -8,17 +8,6 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class VmControllerTest {
-    @Test void opensTheSystemFileChooser() throws Exception {
-        var gateway = mock(VmGatewayService.class);
-        var controller = new VmController(gateway);
-        var mapper = tools.jackson.databind.json.JsonMapper.builder().build();
-        var selected = mapper.readTree("{\"path\":\"/home/user/Downloads/ubuntu.iso\"}");
-        var cancelled = mapper.readTree("{\"path\":null}");
-        when(gateway.selectIso()).thenReturn(selected, cancelled);
-        assertEquals(selected, controller.selectIso());
-        assertTrue(controller.selectIso().path("path").isNull());
-        verify(gateway, times(2)).selectIso();
-    }
     private static final String RUN = "automantle-vm-" + "a".repeat(32);
     @Test void validatesTerminalBytesAndBindsWritesToOneRun() throws Exception {
         var gateway = mock(VmGatewayService.class);
@@ -34,23 +23,20 @@ class VmControllerTest {
     }
     @Test void validatesSavedSettingsBeforeContactingGateway() throws Exception {
         var gateway=mock(VmGatewayService.class);var controller=new VmController(gateway);var profile=UUID.randomUUID();
-        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",null,512,1,false,"/tmp/os.iso")));
-        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",profile,127,1,false,"/tmp/os.iso")));
-        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",profile,512,0,false,"/tmp/os.iso")));
-        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("\n",profile,512,1,false,"/tmp/os.iso")));
-        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",profile,512,1,false,null)));
-        assertThrows(IllegalArgumentException.class,()->controller.update("../host",new VmController.Settings("VM",profile,512,1,false,null)));
+        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",null,512,1,false)));
+        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",profile,127,1,false)));
+        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("VM",profile,512,0,false)));
+        assertThrows(IllegalArgumentException.class,()->controller.create(new VmController.Settings("\n",profile,512,1,false)));
+        assertThrows(IllegalArgumentException.class,()->controller.update("../host",new VmController.Settings("VM",profile,512,1,false)));
         verifyNoInteractions(gateway);
-        controller.create(new VmController.Settings(" First ",profile,2048,2,true," /tmp/os.iso "));
-        verify(gateway).command(Map.of("command","create-machine","settings",Map.of("name","First","agentProfileId",profile.toString(),"memoryMib",2048,"vcpuCount",2,"setup",true),"isoPath","/tmp/os.iso"));
+        controller.create(new VmController.Settings(" First ",profile,2048,2,true));
+        verify(gateway).command(Map.of("command","create-machine","settings",Map.of("name","First","agentProfileId",profile.toString(),"memoryMib",2048,"vcpuCount",2,"setup",true)));
     }
     @Test void machinePowerCopyAndDeleteUseStableIdentity() throws Exception {
         var gateway=mock(VmGatewayService.class);var controller=new VmController(gateway);
-        controller.start("antigravity");controller.reinstall("antigravity");controller.completeInstallation("antigravity");controller.stop("antigravity");controller.forceStop("antigravity");
+        controller.start("antigravity");controller.stop("antigravity");controller.forceStop("antigravity");
         controller.copy("antigravity",new VmController.CopyVm("Copy"));controller.delete("antigravity");
         verify(gateway).command(Map.of("command","start-machine","id","antigravity"));
-        verify(gateway).command(Map.of("command","reinstall-machine","id","antigravity"));
-        verify(gateway).command(Map.of("command","complete-installation","id","antigravity"));
         verify(gateway).command(Map.of("command","shutdown-machine","id","antigravity"));
         verify(gateway).command(Map.of("command","force-stop-machine","id","antigravity"));
         verify(gateway).command(Map.of("command","copy-machine","id","antigravity","name","Copy"));

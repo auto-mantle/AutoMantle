@@ -143,7 +143,6 @@ struct Defaults {
     kernel: PathBuf,
     rootfs: PathBuf,
     tls: PathBuf,
-    credentials: Option<PathBuf>,
 }
 impl Defaults {
     fn load() -> Result<Self> {
@@ -153,7 +152,6 @@ impl Defaults {
             kernel: data.join("kernel"),
             rootfs: data.join("linux.ext4"),
             tls: data.join("tls/tls.json"),
-            credentials: None,
         })
     }
 }
@@ -209,60 +207,49 @@ impl Manager {
     fn import_machine(&mut self, request: Value, mut stream: UnixStream) {
         self.imports
             .retain_mut(|import| !import.worker.is_finished());
-        let response =
-            (|| -> Result<(Option<String>, crate::machines::Settings, Option<String>)> {
-                if self.imports.len() >= MAX_IMPORTS {
-                    return Err("Four VM copies are already in progress".into());
+        let response = (|| -> Result<(Option<String>, crate::machines::Settings)> {
+            if self.imports.len() >= MAX_IMPORTS {
+                return Err("Four VM copies are already in progress".into());
+            }
+            let command = request["command"].as_str().ok_or("command is required")?;
+            let allowed = if command == "copy-machine" {
+                vec!["command", "id", "name"]
+            } else {
+                vec!["command", "settings"]
+            };
+            if request
+                .as_object()
+                .is_none_or(|r| r.keys().any(|k| !allowed.contains(&k.as_str())))
+            {
+                return Err("Unknown VM creation field".into());
+            }
+            let source = if command == "copy-machine" {
+                let id = request["id"]
+                    .as_str()
+                    .ok_or("VM ID is required")?
+                    .to_owned();
+                if self.busy_machine(&id) {
+                    return Err("Stop the VM before copying it".into());
                 }
-                let command = request["command"].as_str().ok_or("command is required")?;
-                let allowed = if command == "copy-machine" {
-                    vec!["command", "id", "name"]
-                } else {
-                    vec!["command", "settings", "isoPath"]
-                };
-                if request
-                    .as_object()
-                    .is_none_or(|r| r.keys().any(|k| !allowed.contains(&k.as_str())))
-                {
-                    return Err("Unknown VM creation field".into());
-                }
-                let source = if command == "copy-machine" {
-                    let id = request["id"]
-                        .as_str()
-                        .ok_or("VM ID is required")?
-                        .to_owned();
-                    if self.busy_machine(&id) {
-                        return Err("Stop the VM before copying it".into());
-                    }
-                    Some(id)
-                } else {
-                    None
-                };
-                let settings = if let Some(id) = &source {
-                    let mut s = self.storage.machine(id)?.settings;
-                    s.name = request["name"]
-                        .as_str()
-                        .ok_or("Copy name is required")?
-                        .to_owned();
-                    s
-                } else {
-                    serde_json::from_value(request["settings"].clone())?
-                };
-                settings.validate()?;
-                self.backend.validate_profile(&settings.agent_profile_id)?;
-                let iso = if source.is_none() {
-                    Some(
-                        request["isoPath"]
-                            .as_str()
-                            .ok_or("ISO path is required")?
-                            .to_owned(),
-                    )
-                } else {
-                    None
-                };
-                Ok((source, settings, iso))
-            })();
-        let (source, settings, iso) = match response {
+                Some(id)
+            } else {
+                None
+            };
+            let settings = if let Some(id) = &source {
+                let mut s = self.storage.machine(id)?.settings;
+                s.name = request["name"]
+                    .as_str()
+                    .ok_or("Copy name is required")?
+                    .to_owned();
+                s
+            } else {
+                serde_json::from_value(request["settings"].clone())?
+            };
+            settings.validate()?;
+            self.backend.validate_profile(&settings.agent_profile_id)?;
+            Ok((source, settings))
+        })();
+        let (source, settings) = match response {
             Ok(value) => value,
             Err(e) => {
                 let _ = writeln!(stream, "{}", json!({"error":e.to_string()}));
@@ -273,10 +260,7 @@ impl Manager {
         self.spawn_import(stream, move |cancel| {
             let vm = match source {
                 Some(id) => store.copy_machine(&id, settings.name, cancel),
-                None => store.create_iso_machine(
-                    settings,
-                    Path::new(iso.as_deref().ok_or("ISO path is required")?),
-                ),
+                None => store.create_machine(settings, &crate::managed::base_image()?, cancel),
             }?;
             Ok(serde_json::to_value(vm)?)
         });
@@ -289,7 +273,11 @@ impl Manager {
                 .machine_runs
                 .get(&machine.id)
                 .and_then(|id| self.tasks.get(id).map(|task| (id, task)));
-            value["os"] = json!("Linux");
+            value["os"] = json!(if machine.managed_image.is_some() {
+                "Ubuntu 24.04"
+            } else {
+                "Legacy environment"
+            });
             value["state"] = json!("stopped");
             value["runId"] = Value::Null;
             value["error"] = Value::Null;
@@ -310,58 +298,12 @@ impl Manager {
         if self.busy_machine(id) {
             return Err("VM is already active".into());
         }
-        if vm.iso_path.is_some() {
-            return self.start_iso_machine(vm, false);
-        }
-        let mut args = vec![
-            "--saved-disk".into(),
-            id.into(),
-            "--storage-mode".into(),
-            "prepare".into(),
-            "--kernel".into(),
-            self.defaults.kernel.to_string_lossy().into_owned(),
-            "--agent-profile-id".into(),
-            vm.settings.agent_profile_id,
-            "--memory-mib".into(),
-            vm.settings.memory_mib.to_string(),
-            "--vcpu-count".into(),
-            vm.settings.vcpu_count.to_string(),
-            "--timeout-seconds".into(),
-            "0".into(),
-            "--network".into(),
-            "proxy".into(),
-            "--mode".into(),
-            if vm.settings.setup { "setup" } else { "normal" }.into(),
-        ];
-        if self.defaults.tls.is_file() {
-            args.extend([
-                "--tls-ca-config".into(),
-                self.defaults.tls.to_string_lossy().into_owned(),
-            ]);
-        }
-        if let Some(path) = &self.defaults.credentials {
-            args.extend([
-                "--credentials-config".into(),
-                path.to_string_lossy().into_owned(),
-            ]);
-        }
-        let run = self.launch(&args)?;
-        let run_id = run["id"].as_str().ok_or("Missing run ID")?;
-        self.machine_runs.insert(id.into(), run_id.into());
-        eprintln!("machine={id} run={run_id}");
-        self.list_machines()?
-            .as_array()
-            .ok_or("Missing VM definitions")?
-            .iter()
-            .find(|v| v["id"] == id)
-            .cloned()
-            .ok_or_else(|| "Missing VM definition".into())
+        self.start_managed_machine(vm)
     }
-    fn start_iso_machine(
-        &mut self,
-        vm: crate::machines::Machine,
-        reinstall: bool,
-    ) -> Result<Value> {
+    fn start_managed_machine(&mut self, vm: crate::machines::Machine) -> Result<Value> {
+        if vm.managed_image.is_none() {
+            return Err("This legacy VM is preserved on disk. Create a managed environment to use automatic setup.".into());
+        }
         let id = vm.id.clone();
         if self.busy_machine(&id) {
             return Err("VM is already active".into());
@@ -389,7 +331,7 @@ impl Manager {
         let tls = self.defaults.tls.clone();
         let finished = Arc::clone(&record);
         let cancellation = Arc::clone(&cancel);
-        let installing = reinstall || !vm.install_complete;
+
         let worker_run_id = run_id.clone();
         let worker = thread::Builder::new().name(run_id.clone()).spawn(move || {
             let _lease = lease;
@@ -397,7 +339,6 @@ impl Manager {
                 qemu::run(
                     vm,
                     _lease.path.clone(),
-                    installing,
                     backend,
                     credentials,
                     tls,
@@ -732,22 +673,6 @@ impl Manager {
             "list-machines" => self.list_machines(),
             "start-machine" => {
                 self.start_machine(request["id"].as_str().ok_or("VM ID is required")?)
-            }
-            "reinstall-machine" => {
-                let id = request["id"].as_str().ok_or("VM ID is required")?;
-                let vm = self.storage.machine(id)?;
-                if vm.iso_path.is_none() {
-                    return Err("VM has no installer ISO".into());
-                }
-                self.start_iso_machine(vm, true)
-            }
-            "complete-installation" => {
-                let id = request["id"].as_str().ok_or("VM ID is required")?;
-                if self.busy_machine(id) {
-                    return Err("Shut down the installer first".into());
-                }
-                self.storage.mark_install_complete(id)?;
-                Ok(json!({"updated":true}))
             }
             "shutdown-machine" | "force-stop-machine" => self.stop_machine(
                 request["id"].as_str().ok_or("VM ID is required")?,
