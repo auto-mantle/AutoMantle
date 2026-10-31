@@ -133,9 +133,30 @@ impl Backend {
         })
     }
 
-    fn decode(response: reqwest::blocking::Response) -> Result<Value> {
-        if !response.status().is_success() {
-            return Err("backend rejected request".into());
+    fn decode(response: reqwest::blocking::Response, path: &str) -> Result<Value> {
+        let status = response.status();
+        if !status.is_success() {
+            // Do not reflect backend bodies: they can contain internal data or credentials.
+            let detail = match status.as_u16() {
+                404 if path.starts_with("/gateway/agent-profiles/") => {
+                    "The selected Agent Profile could not be found. Refresh Agent Profiles and select an existing profile in the environment settings. If the profile still exists, check that the API and gateway are running from the same release."
+                }
+                401 | 403 => {
+                    "The local API refused gateway access. Check the API service log and that the API and gateway are running from the same release."
+                }
+                404 => {
+                    "The backend endpoint or resource was not found. Check that the API and gateway are running from the same release."
+                }
+                500..=599 => {
+                    "The local API failed to process the request. Check journalctl --user -u automantle-api.service."
+                }
+                _ => "Check the local API service log for the reason.",
+            };
+            return Err(format!(
+                "Local backend rejected {path} (HTTP {}): {detail}",
+                status.as_u16()
+            )
+            .into());
         }
         let mut bytes = Vec::new();
         response.take(MAX_JSON + 1).read_to_end(&mut bytes)?;
@@ -184,7 +205,7 @@ impl Backend {
         body: Option<&Value>,
         active: &dyn Fn() -> bool,
     ) -> Result<Value> {
-        Self::decode(self.send(path, body, active)?)
+        Self::decode(self.send(path, body, active)?, path)
     }
 
     fn evaluate(&self, action: &Value, active: &dyn Fn() -> bool) -> Result<Option<Value>> {
@@ -195,7 +216,7 @@ impl Backend {
         ) {
             return Ok(None);
         }
-        Self::decode(response).map(Some)
+        Self::decode(response, "/gateway/evaluate").map(Some)
     }
     pub fn report_history(&self, event: &Value) {
         let result = self
@@ -390,4 +411,71 @@ fn setup_expiry(value: &Value) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value.as_str().ok_or("missing setup session expiry")?)
         .map(|v| v.with_timezone(&Utc))
         .map_err(|_| "invalid setup session expiry".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Write, net::TcpListener};
+
+    fn response(status: u16, body: &str) -> reqwest::blocking::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_owned();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let response = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn backend_errors_identify_operation_status_and_recovery_without_response_data() {
+        let path = "/gateway/agent-profiles/12345678-1234-4234-8234-123456789abc";
+        for (status, hint) in [
+            (404, "Agent Profile"),
+            (403, "refused gateway access"),
+            (500, "journalctl"),
+        ] {
+            let error = Backend::decode(response(status, "private backend details"), path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(path));
+            assert!(error.contains(&format!("HTTP {status}")));
+            assert!(error.contains(hint));
+            assert!(!error.contains("private backend details"));
+        }
+    }
+
+    #[test]
+    fn successful_backend_responses_still_require_valid_json() {
+        assert_eq!(
+            Backend::decode(response(200, r#"{"status":"ready"}"#), "/gateway/health").unwrap()["status"],
+            "ready"
+        );
+        assert!(Backend::decode(response(200, "not JSON"), "/gateway/health").is_err());
+    }
 }

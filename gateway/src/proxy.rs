@@ -33,8 +33,6 @@ pub(crate) use request::{valid_host, valid_method, valid_path};
 use response::{credential_response, response_line, stream_response};
 
 const MAX_HEADER: usize = 32 * 1024;
-const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
-const MAX_DOWNLOAD_RESPONSE: u64 = 128 * 1024 * 1024;
 
 pub struct Proxy {
     stopped: Arc<AtomicBool>,
@@ -342,7 +340,7 @@ fn handle_observed(stream: Stream, context: &Context, observation: &mut Observat
                 return reply(&mut client, status, message);
             }
         };
-        client.socket().phase(Duration::from_secs(10));
+        client.socket().phase(Duration::from_secs(300));
         if request.unsupported_forwarding() {
             client.socket().waiting_for_policy();
             return serve(&mut client, &request, secure, context, observation);
@@ -351,18 +349,22 @@ fn handle_observed(stream: Stream, context: &Context, observation: &mut Observat
             client.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             client.flush()?;
         }
+        let mut spool = body::Spool::default();
         let body_result = if request.chunked {
-            read_chunked_request(&mut client, &mut request.body)
+            read_chunked_request(&mut client, &mut spool, &|| context.active())
         } else {
-            request.body.resize(request.content_length, 0);
-            client
-                .read_exact(&mut request.body)
-                .map_err(|_| "incomplete request body".into())
+            body::copy_exact(
+                &mut client,
+                &mut spool,
+                request.content_length as u64,
+                &|| context.active(),
+            )
         };
         if body_result.is_err() {
             observation.report("INVALID_BODY");
             return reply(&mut client, 400, "incomplete request body");
         }
+        request.body = spool.finish()?;
         if writes_body(&request.method) {
             request.body_metadata =
                 Some(body::opaque_metadata(&request.body, &request.content_type)?);
@@ -566,14 +568,16 @@ fn serve(
     }
     result
 }
-fn read_chunked_request(reader: &mut impl Read, body: &mut Vec<u8>) -> Result<()> {
-    let mut framing = 0usize;
+fn read_chunked_request(
+    reader: &mut impl Read,
+    body: &mut impl Write,
+    active: &impl Fn() -> bool,
+) -> Result<()> {
     loop {
-        let line = response_line(reader)?;
-        framing += line.len();
-        if framing > 64 * 1024 {
-            return Err("request chunk framing too large".into());
+        if !active() {
+            return Err("request cancelled".into());
         }
+        let line = response_line(reader)?;
         let text =
             std::str::from_utf8(&line[..line.len() - 2]).map_err(|_| "invalid request chunk")?;
         let size_text = text.split(';').next().unwrap();
@@ -590,12 +594,7 @@ fn read_chunked_request(reader: &mut impl Read, body: &mut Vec<u8>) -> Result<()
             }
             return Ok(());
         }
-        if size > body::MAX_BODY.saturating_sub(body.len()) {
-            return Err("request body too large".into());
-        }
-        let start = body.len();
-        body.resize(start + size, 0);
-        reader.read_exact(&mut body[start..])?;
+        body::copy_exact(reader, body, size as u64, active)?;
         let mut crlf = [0; 2];
         reader.read_exact(&mut crlf)?;
         if crlf != *b"\r\n" {
@@ -623,4 +622,37 @@ fn reply(client: &mut impl Write, status: u16, message: &str) -> Result<()> {
     )?;
     client.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn uploads_above_previous_cap_are_spooled_and_fingerprinted() {
+        let size = 9 * 1024 * 1024;
+        let header = format!(
+            "POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {size}\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        let mut request = parse_request(header.as_bytes(), None).unwrap();
+        assert!(!request.unsupported_forwarding());
+        let mut spool = body::Spool::default();
+        body::copy_exact(&mut std::io::repeat(b'x'), &mut spool, size, &|| true).unwrap();
+        request.body = spool.finish().unwrap();
+        assert_eq!(request.body.len(), size as usize);
+        let metadata = body::opaque_metadata(&request.body, &request.content_type).unwrap();
+        assert_eq!(metadata["size_bytes"], size);
+    }
+
+    #[test]
+    fn chunked_uploads_have_no_cumulative_framing_quota() {
+        let mut encoded = b"1\r\nx\r\n".repeat(22000);
+        encoded.extend_from_slice(b"0\r\n\r\n");
+        let mut spool = body::Spool::default();
+        read_chunked_request(&mut encoded.as_slice(), &mut spool, &|| true).unwrap();
+        let payload = spool.finish().unwrap();
+        assert_eq!(payload.len(), 22000);
+        assert!(payload.iter().all(|b| *b == b'x'));
+        assert!(read_chunked_request(&mut &b"3\r\nx"[..], &mut std::io::sink(), &|| true).is_err());
+    }
 }

@@ -24,7 +24,6 @@ The gateway configuration contains a loopback `backendUrl` such as `http://127.0
 | `SESSION_TIMEOUT` | `15m` | Browser session timeout. |
 | `FRONTEND_URL` | `http://localhost:${PORT}` | Allowed loopback frontend origin. |
 | `REQUIRE_HTTPS` | `false` | Require an HTTPS frontend URL and secure session cookie. |
-| `HTTP_POLICY_MAX_BODY_SIZE` | `8MB` | Maximum HTTP body size accepted by policy metadata. |
 
 The API listens on `127.0.0.1`. Its gateway socket is supplied by the CLI. Browser state-changing requests use a CSRF token from `GET /csrf` in the `X-CSRF-TOKEN` header; `/gateway/**` is reserved for local native-process requests.
 

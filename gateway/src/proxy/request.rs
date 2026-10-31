@@ -13,7 +13,7 @@ pub(super) struct Request {
     pub(super) content_length: usize,
     pub(super) chunked: bool,
     pub(super) content_type: String,
-    pub(super) body: Vec<u8>,
+    pub(super) body: body::Payload,
     pub(super) body_metadata: Option<serde_json::Value>,
     pub(super) forwarding_error: Option<(u16, &'static str)>,
 }
@@ -74,7 +74,7 @@ impl Request {
                 .iter()
                 .flat_map(|(name, value)| [name.as_bytes(), value.as_bytes()]),
         )
-        .chain(std::iter::once(self.body.as_slice()))
+        .chain(std::iter::once(&*self.body))
         {
             fingerprint.update(&(bytes.len() as u64).to_be_bytes());
             fingerprint.update(bytes);
@@ -255,7 +255,6 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
     if chunked && (length.is_some() || !writes_body(method)) {
         return Err((400, "ambiguous or unsupported body framing"));
     }
-    let mut forwarding_error = None;
     let content_length = match length {
         None => 0,
         Some(value) => {
@@ -265,14 +264,9 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
             {
                 return Err((400, "invalid Content-Length"));
             }
-            let size = value.parse::<usize>().unwrap_or(usize::MAX);
-            if size > body::MAX_BODY {
-                forwarding_error = Some((
-                    413,
-                    "policy allowed request; body exceeds forwarding capacity",
-                ));
-            }
-            size
+            value
+                .parse::<usize>()
+                .map_err(|_| (400, "invalid Content-Length"))?
         }
     };
     let media = headers.iter().find(|(name, _)| name == "content-type");
@@ -293,9 +287,9 @@ pub(super) fn parse_request(raw: &[u8], tunnel_host: Option<&str>) -> ParseResul
         content_length,
         chunked,
         content_type,
-        body: Vec::new(),
+        body: body::Payload::default(),
         body_metadata: None,
-        forwarding_error,
+        forwarding_error: None,
     })
 }
 pub(super) fn connect_host(authority: &str) -> Option<String> {
