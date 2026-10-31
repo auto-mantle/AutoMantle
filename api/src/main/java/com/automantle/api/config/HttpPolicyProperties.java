@@ -5,7 +5,6 @@ import org.springframework.util.unit.DataSize;
 
 @ConfigurationProperties(prefix = "app.http-policy")
 public record HttpPolicyProperties(
-        DataSize maxBodySize,
         DataSize maxPreviewSize,
         int maxRuleValues,
         int maxCredentialPlacements,
@@ -14,11 +13,8 @@ public record HttpPolicyProperties(
         int maxContentTypeLength,
         int maxPathLength) {
     public HttpPolicyProperties {
-        if (maxBodySize == null
-                || maxPreviewSize == null
-                || maxBodySize.toBytes() <= 0
+        if (maxPreviewSize == null
                 || maxPreviewSize.toBytes() <= 0
-                || maxBodySize.toBytes() > Integer.MAX_VALUE
                 || maxPreviewSize.toBytes() > Integer.MAX_VALUE
                 || maxRuleValues < 1
                 || maxCredentialPlacements < 1

@@ -4,7 +4,8 @@ use serde::{
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, fmt};
-pub const MAX_BODY: usize = 8 * 1024 * 1024;
+mod payload;
+pub use payload::{Payload, Spool, copy_exact};
 pub fn is_json(content_type: &str) -> bool {
     let media_type = content_type.split(';').next().unwrap_or("").trim();
     [
@@ -19,9 +20,6 @@ pub fn opaque_metadata(
     bytes: &[u8],
     content_type: &str,
 ) -> std::result::Result<Value, &'static str> {
-    if bytes.len() > MAX_BODY {
-        return Err("request body too large");
-    }
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     Ok(
         json!({"content_type":content_type,"size_bytes":bytes.len(),"sha256":digest.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>()}),
@@ -29,9 +27,6 @@ pub fn opaque_metadata(
 }
 
 pub fn validate_json_for_injection(bytes: &[u8]) -> std::result::Result<(), &'static str> {
-    if bytes.len() > MAX_BODY {
-        return Err("request body too large");
-    }
     let mut parser = serde_json::Deserializer::from_slice(bytes);
     Json(0)
         .deserialize(&mut parser)

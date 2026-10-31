@@ -337,6 +337,10 @@ impl Credentials {
     }
 
     pub fn body_preview(&self, bytes: &[u8]) -> serde_json::Value {
+        // Large bodies are forwarded, but do not need to become large policy previews.
+        if bytes.len() > 16 * 1024 {
+            return serde_json::json!({"omitted":true});
+        }
         if crate::body::validate_json_for_injection(bytes).is_err() {
             return serde_json::json!({"omitted":true});
         }

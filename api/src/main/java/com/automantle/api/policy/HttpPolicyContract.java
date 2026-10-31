@@ -191,7 +191,7 @@ public final class HttpPolicyContract {
         }
         long size = ((Number) byteSize).longValue();
         String digest = fields.text("sha256");
-        if (size < 0 || size > limits.maxBodySize().toBytes() || !HttpBody.validSha256(digest)) {
+        if (size < 0 || !HttpBody.validSha256(digest)) {
             throw new IllegalArgumentException("Invalid body size or SHA-256");
         }
         if (!validContentType(type) || !HttpBody.matchesEmptyFingerprint(size, digest)) {
@@ -205,7 +205,7 @@ public final class HttpPolicyContract {
         if (preview != null && !preview.omitted() && !supportsJsonPreview(type)) {
             throw new IllegalArgumentException("Opaque body previews must be omitted");
         }
-        return new HttpBody(type, (int) size, digest, preview);
+        return new HttpBody(type, size, digest, preview);
     }
 
     private boolean validContentType(String type) {

@@ -7,7 +7,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-public record HttpBody(String contentType, int sizeBytes, String sha256, HttpBodyPreview preview) {
+public record HttpBody(String contentType, long sizeBytes, String sha256, HttpBodyPreview preview) {
     private static final String EMPTY_SHA256 = hashEmptyBody();
 
     public static boolean matchesEmptyFingerprint(long size, String sha256) {
@@ -35,7 +35,7 @@ public record HttpBody(String contentType, int sizeBytes, String sha256, HttpBod
         }
     }
 
-    public HttpBody(String contentType, int sizeBytes, String sha256) {
+    public HttpBody(String contentType, long sizeBytes, String sha256) {
         this(contentType, sizeBytes, sha256, null);
     }
 

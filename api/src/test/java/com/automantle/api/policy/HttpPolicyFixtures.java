@@ -8,7 +8,7 @@ public final class HttpPolicyFixtures {
 
     public static HttpPolicyProperties limits() {
         return new HttpPolicyProperties(
-                DataSize.ofMegabytes(8), DataSize.ofKilobytes(16), 100, 32, 128, 1024, 1024, 2048);
+                DataSize.ofKilobytes(16), 100, 32, 128, 1024, 1024, 2048);
     }
 
     public static HttpPolicyValidator validator() {

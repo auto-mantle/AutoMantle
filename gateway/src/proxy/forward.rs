@@ -1,6 +1,6 @@
 use super::{
-    Context, MAX_DOWNLOAD_RESPONSE, MAX_RESPONSE, Observation, Request, RequestMonitor, Result,
-    credential_response, reply, stream_response, writes_body,
+    Context, Observation, Request, RequestMonitor, Result, credential_response, reply,
+    stream_response, writes_body,
 };
 use std::io::{Read, Write};
 
@@ -60,7 +60,9 @@ pub(super) fn forward_observed(
     let mut outgoing = request.clone();
     outgoing.headers = output.headers;
     outgoing.target = output.target;
-    outgoing.body = output.body;
+    if let Some(body) = output.body {
+        outgoing.body = body;
+    }
     let request = &outgoing;
     eprintln!(
         "network decision=allow method={} host={}",
@@ -152,15 +154,16 @@ fn send_upstream_response(
     observation: Option<&mut Observation>,
 ) -> Result<()> {
     if authenticated {
-        let (response, decoded) = match credential_response(upstream, &request.method) {
-            Ok(response) => response,
-            Err(_) => {
-                if let Some(event) = observation {
-                    event.report("RESPONSE_BLOCKED");
+        let (response, decoded) =
+            match credential_response(upstream, &request.method, &|| context.active()) {
+                Ok(response) => response,
+                Err(_) => {
+                    if let Some(event) = observation {
+                        event.report("RESPONSE_BLOCKED");
+                    }
+                    return reply(client, 502, "credential response framing failed");
                 }
-                return reply(client, 502, "credential response framing failed");
-            }
-        };
+            };
         if !context.active() {
             return Ok(());
         }
@@ -172,16 +175,11 @@ fn send_upstream_response(
             }
             return reply(client, 502, "credential response blocked");
         }
-        client.write_all(&response)?;
+        crate::body::copy_exact(&mut &*response, client, response.len() as u64, &|| {
+            context.active()
+        })?;
         client.flush()?;
         return Ok(());
     }
-    let limit = if request.method == "GET" {
-        MAX_DOWNLOAD_RESPONSE
-    } else {
-        MAX_RESPONSE
-    };
-    stream_response(client, upstream, &request.method, limit, || {
-        context.active()
-    })
+    stream_response(client, upstream, &request.method, || context.active())
 }

@@ -21,7 +21,7 @@ pub struct Input<'a> {
 pub struct Output {
     pub headers: Vec<(String, String)>,
     pub target: String,
-    pub body: Vec<u8>,
+    pub body: Option<crate::body::Payload>,
 }
 
 pub fn names(value: &str, credentials: &Credentials) -> Vec<String> {
@@ -258,7 +258,7 @@ pub fn materialize(
     let mut output = Output {
         headers: input.headers.to_vec(),
         target: input.target.into(),
-        body: input.body.to_vec(),
+        body: None,
     };
     for placement in expected.iter().filter(|p| p.location == "header") {
         let value = output
@@ -305,43 +305,31 @@ pub fn materialize(
     if expected.iter().any(|p| p.location == "json") {
         let mut value: Value =
             serde_json::from_slice(input.body).map_err(|_| "invalid credential JSON")?;
-        let mut size = serde_json::to_vec(&value)
-            .map_err(|_| "credential JSON unavailable")?
-            .len();
         for placement in expected.iter().filter(|p| p.location == "json") {
             let field = value
                 .pointer_mut(&placement.selector)
                 .ok_or("credential JSON field missing")?;
-            let previous = serde_json::to_vec(&*field)
-                .map_err(|_| "credential JSON unavailable")?
-                .len();
             let original = field.as_str().ok_or("credential JSON field changed")?;
             let secret = credentials
                 .secret(&placement.placeholder)
                 .ok_or("credential unavailable")?;
-            let limit = crate::body::MAX_BODY.saturating_sub(size - previous);
             *field = Value::String(replace_name(
                 original,
                 &placement.placeholder,
                 secret,
-                limit,
+                usize::MAX,
             )?);
-            size = size - previous
-                + serde_json::to_vec(&*field)
-                    .map_err(|_| "credential JSON unavailable")?
-                    .len();
-            if size > crate::body::MAX_BODY {
-                return Err("credential JSON exceeds forwarding limit".into());
-            }
         }
-        output.body = serde_json::to_vec(&value).map_err(|_| "credential JSON unavailable")?;
+        let mut spool = crate::body::Spool::default();
+        serde_json::to_writer(&mut spool, &value)?;
+        output.body = Some(spool.finish()?);
     }
     let header_bytes: usize = output
         .headers
         .iter()
         .map(|(name, value)| name.len() + value.len() + 4)
         .sum();
-    if output.body.len() > crate::body::MAX_BODY || output.target.len() + header_bytes > 32 * 1024 {
+    if output.target.len() + header_bytes > 32 * 1024 {
         return Err("credential request exceeds forwarding limits".into());
     }
     Ok(output)

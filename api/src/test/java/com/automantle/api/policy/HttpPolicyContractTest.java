@@ -16,10 +16,10 @@ class HttpPolicyContractTest {
     @Test
     void configuredLimitsApplyToActionsRulesAndCredentials() {
         var limits = new HttpPolicyProperties(
-                DataSize.ofBytes(6), DataSize.ofBytes(2), 1, 1, 3, 4, 16, 5);
+                DataSize.ofBytes(2), 1, 1, 3, 4, 16, 5);
         var configured = new HttpPolicyContract(limits, new HttpPolicyValidator(limits));
 
-        assertThrows(IllegalArgumentException.class, () -> configured.action(writeAction(body())));
+        assertDoesNotThrow(() -> configured.action(writeAction(body())));
         assertThrows(IllegalArgumentException.class,
                 () -> configured.action(action("api.example.com", "/longer")));
         var twoMethods = new HashMap<>(match("/api"));
@@ -216,7 +216,21 @@ class HttpPolicyContractTest {
 
     static Map<String, Object> body() {
         return Map.of(
-                "content_type", "application/json", "size_bytes", 7, "sha256", "a".repeat(64));
+                "content_type", "application/json", "size_bytes", 7L, "sha256", "a".repeat(64));
+    }
+
+    @Test
+    void bodyFingerprintsAcceptLargeTransfersWithoutTruncatingTheirSize() {
+        for (long size : List.of(9L * 1024 * 1024, 129L * 1024 * 1024, 5L * 1024 * 1024 * 1024)) {
+            var metadata = new HashMap<>(body());
+            metadata.put("size_bytes", size);
+            var action = contract.action(writeAction(metadata));
+            assertEquals(metadata, action.metadata().get("body"));
+            assertEquals(action, contract.action(action.metadata()));
+        }
+        var integerSize = new HashMap<>(body());
+        integerSize.put("size_bytes", 7);
+        assertDoesNotThrow(() -> contract.action(writeAction(integerSize)));
     }
 
     @Test
@@ -237,7 +251,6 @@ class HttpPolicyContractTest {
         for (var change :
                 List.of(
                         Map.<String, Object>of("size_bytes", -1),
-                        Map.<String, Object>of("size_bytes", HttpPolicyFixtures.limits().maxBodySize().toBytes() + 1),
                         Map.<String, Object>of("size_bytes", 7.0),
                         Map.<String, Object>of("sha256", "bad"),
                         Map.<String, Object>of("content_type", "invalid"),
