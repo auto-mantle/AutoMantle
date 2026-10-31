@@ -78,17 +78,15 @@ jobs:
             sha256sum --check SHA256SUMS
             bin/cloud-hypervisor --version
             bin/automantle-qemu --version
-            # TCG checks the packaged libraries and restricted network arguments without KVM or an OS.
-            status=0
-            timeout 2 bin/automantle-qemu -machine q35 -accel tcg -display none -S \
-              -nic 'user,restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:/bin/true' \
-              -monitor none || status=$?
-            [[ $status == 124 ]]
+            # Check the missing-ROM failure and the gateway's explicit ROM-free NIC.
+            bash ../../release/check-qemu-network.sh bin/automantle-qemu
             # Exercise the GTK installer window, including firmware loading and GIO initialization.
             status=0
             GIO_EXTRA_MODULES=/usr/lib/x86_64-linux-gnu/gio/modules \
               xvfb-run -a timeout 3 bin/automantle-qemu -machine q35 -accel tcg -display gtk -S \
-                -nic none -monitor none 2>qemu-gtk-check.log || status=$?
+                -netdev 'user,id=proxy,restrict=on,guestfwd=tcp:10.0.2.100:3128-cmd:/bin/true' \
+                -device 'e1000e,netdev=proxy,romfile=' \
+                -monitor none 2>qemu-gtk-check.log || status=$?
             cat qemu-gtk-check.log
             [[ $status == 124 ]]
             if grep -E 'undefined symbol|Failed to load module|could not load PC BIOS' qemu-gtk-check.log; then

@@ -167,15 +167,17 @@ pub fn run(
             .arg("-smp")
             .arg(machine.settings.vcpu_count.to_string())
             .args(["-drive", "file=rootfs,format=raw,if=virtio"])
-            .arg("-nic")
+            .arg("-netdev")
             .arg(format!(
-                "user,restrict=on,guestfwd=tcp:{PROXY_ADDRESS}-cmd:{}",
+                "user,id=proxy,restrict=on,guestfwd=tcp:{PROXY_ADDRESS}-cmd:{}",
                 format!(
                     "'{}'",
                     local_helper.to_string_lossy().replace('\'', "'\\''")
                 )
                 .replace(',', ",,")
             ))
+            // Boot from the ISO or disk; do not require an external PXE option ROM.
+            .args(["-device", "e1000e,netdev=proxy,romfile="])
             .arg("-qmp")
             .arg(format!("unix:{},server=on,wait=off", qmp.display()))
             .args(["-display", "gtk", "-vga", "std", "-monitor", "none"])
